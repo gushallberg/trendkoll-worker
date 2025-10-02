@@ -66,32 +66,35 @@ def gnews_snippets_sv(query, max_items=3):
     return items
 
 def openai_summarize(topic, snippets):
+    import os, json, urllib.request
+    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
     system = (
-        "Skriv en kort svensk sammanfattning (120–180 ord) om varför detta ämne trendar just nu. "
-        "Ha en tydlig rubrik överst (en rad), följt av 2–3 punktlistor med de viktigaste orsakerna. "
-        "Avsluta med 1–2 förslag på relevanta produkter/tjänster som kan länkas som affiliate. "
-        "Skriv utan markdown, bara ren text med radbrytningar."
+        "Du är en svensk nyhetsredaktör. Skriv en kort sammanfattning (120–180 ord) "
+        "om varför ämnet trendar nu. Rubrik överst, sedan 2–3 punktlistor, avsluta med 1–2 affiliate-idéer. "
+        "Ingen markdown, bara ren text."
     )
     snip = "; ".join([f"{s['title']} ({s['link']})" for s in snippets]) if snippets else "Inga källsnuttar"
 
-    payload = {
+    data = json.dumps({
         "model": "gpt-5",
         "input": [
             {"role": "system", "content": system},
             {"role": "user", "content": f"Ämne: {topic}\nNyhetssnuttar: {snip}"}
         ]
-    }
-    data = json.dumps(payload).encode("utf-8")
+    }).encode("utf-8")
 
     req = urllib.request.Request(
         "https://api.openai.com/v1/responses",
         data=data,
         headers={"Content-Type": "application/json", "Authorization": f"Bearer {OPENAI_API_KEY}"}
     )
-    with urllib.request.urlopen(req) as resp:
-        out = resp.read().decode("utf-8")
+    with urllib.request.urlopen(req) as r:
+        out = r.read().decode("utf-8")
     j = json.loads(out)
+    # Responses API: hämta texten så här:
     return j["output"][0]["content"][0]["text"]
+
 
 def wp_post_trend(title, body, topics=None, excerpt=""):
     url = f"{WP_BASE_URL}/wp-json/trendkollen/v1/ingest"
@@ -144,4 +147,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
