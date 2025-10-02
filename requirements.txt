@@ -1,0 +1,4 @@
+pytrends
+feedparser
+requests
+python-dotenv
