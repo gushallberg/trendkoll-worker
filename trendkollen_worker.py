@@ -3,35 +3,61 @@ from datetime import datetime
 from urllib.parse import quote
 from dotenv import load_dotenv
 
-# Ladda miljövariabler (Render sätter dessa automatiskt)
 load_dotenv()
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-WP_BASE_URL    = os.getenv("WP_BASE_URL")      # ex: https://trendkoll.se
-WP_USER        = os.getenv("WP_USER")          # WP-användare (den du skapade App Password för)
-WP_APP_PASS    = os.getenv("WP_APP_PASS")      # Application Password
+WP_BASE_URL    = os.getenv("WP_BASE_URL")
+WP_USER        = os.getenv("WP_USER")
+WP_APP_PASS    = os.getenv("WP_APP_PASS")
 MAX_TRENDS     = int(os.getenv("MAX_TRENDS", "5"))
 
-# ---------- Helpers ----------
+UA_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+}
+
+def fetch_rss(url):
+    """Hämta RSS med headers och returnera feedparser-parsning."""
+    try:
+        r = requests.get(url, headers=UA_HEADERS, timeout=15)
+        r.raise_for_status()
+        return feedparser.parse(r.text)
+    except Exception as e:
+        print("⚠️ RSS-fel på", url, "→", e)
+        return feedparser.FeedParserDict(entries=[])
 
 def get_trending_topics(max_items=5):
     """
-    Hämtar dagliga trender för Sverige via Googles officiella RSS.
-    Stabilare än pytrends och blockeras inte lika lätt.
+    Försök i ordning:
+    1) Google Trends daily RSS, Sverige (SE)
+    2) Google Trends daily RSS, Sverige med engelsk locale
+    3) Google Trends daily RSS, USA (US)
+    4) Fallback: Google News huvudflöde för Sverige (tar rubriker som topics)
     """
-    url = "https://trends.google.com/trends/trendingsearches/daily/rss?geo=SE"
-    feed = feedparser.parse(url)
-    topics = [entry.title for entry in feed.entries[:max_items]]
+    urls = [
+        "https://trends.google.com/trends/trendingsearches/daily/rss?geo=SE",
+        "https://trends.google.com/trends/trendingsearches/daily/rss?geo=SE&hl=en-US",
+        "https://trends.google.com/trends/trendingsearches/daily/rss?geo=US&hl=en-US",
+    ]
+    for u in urls:
+        feed = fetch_rss(u)
+        topics = [e.title for e in feed.entries[:max_items]] if feed.entries else []
+        if topics:
+            print("✅ Hämtade topics från:", u)
+            return topics
+
+    # Sista fallback – Google News Sverige (tar rubriker som topics)
+    gnews = fetch_rss("https://news.google.com/rss?hl=sv-SE&gl=SE&ceid=SE:sv")
+    topics = [e.title for e in gnews.entries[:max_items]] if gnews.entries else []
+    if topics:
+        print("✅ Fallback: tog topics från Google News huvudflöde (SE)")
     return topics
 
 def gnews_snippets_sv(query, max_items=3):
-    """
-    Hämtar relevanta nyhetssnuttar via Google News RSS för att ge GPT kontext.
-    """
     url = f"https://news.google.com/rss/search?q={quote(query)}&hl=sv-SE&gl=SE&ceid=SE:sv"
-    feed = feedparser.parse(url)
+    feed = fetch_rss(url)
     items = []
-    for entry in feed.entries[:max_items]:
+    for entry in (feed.entries or [])[:max_items]:
         items.append({
             "title": entry.title,
             "link": entry.link,
@@ -40,17 +66,12 @@ def gnews_snippets_sv(query, max_items=3):
     return items
 
 def openai_summarize(topic, snippets):
-    """
-    Kallar OpenAI Responses API för att få en kort svensk sammanfattning.
-    Returnerar ren text (inga markdown-tecken).
-    """
     system = (
         "Skriv en kort svensk sammanfattning (120–180 ord) om varför detta ämne trendar just nu. "
         "Ha en tydlig rubrik överst (en rad), följt av 2–3 punktlistor med de viktigaste orsakerna. "
         "Avsluta med 1–2 förslag på relevanta produkter/tjänster som kan länkas som affiliate. "
         "Skriv utan markdown, bara ren text med radbrytningar."
     )
-    # Gör snippettexten kompakt
     snip = "; ".join([f"{s['title']} ({s['link']})" for s in snippets]) if snippets else "Inga källsnuttar"
 
     payload = {
@@ -65,34 +86,19 @@ def openai_summarize(topic, snippets):
     req = urllib.request.Request(
         "https://api.openai.com/v1/responses",
         data=data,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {OPENAI_API_KEY}"
-        }
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {OPENAI_API_KEY}"}
     )
     with urllib.request.urlopen(req) as resp:
         out = resp.read().decode("utf-8")
     j = json.loads(out)
-    # Plocka ut texten enligt Responses-formatet
     return j["output"][0]["content"][0]["text"]
 
 def wp_post_trend(title, body, topics=None, excerpt=""):
-    """
-    Postar ett trendinlägg via vårt WP-plugin-endpoint.
-    Kräver att Trendkollen Core är aktivt i Live.
-    """
     url = f"{WP_BASE_URL}/wp-json/trendkollen/v1/ingest"
-    payload = {
-        "title": title,
-        "content": body,
-        "excerpt": excerpt,
-        "topics": topics or []
-    }
+    payload = {"title": title, "content": body, "excerpt": excerpt, "topics": topics or []}
     resp = requests.post(url, json=payload, auth=(WP_USER, WP_APP_PASS), timeout=30)
     resp.raise_for_status()
     return resp.json()
-
-# ---------- Main ----------
 
 def main():
     print("🔎 Startar Trendkoll-worker...")
@@ -100,7 +106,7 @@ def main():
 
     topics = get_trending_topics(MAX_TRENDS)
     if not topics:
-        print("⚠️ Hittade inga topics i RSS. Avbryter.")
+        print("⚠️ Hittade fortfarande inga topics. Avbryter.")
         return
 
     for topic in topics:
@@ -110,10 +116,8 @@ def main():
             summary = openai_summarize(topic, snippets)
         except Exception as e:
             print("❌ OpenAI-fel:", e)
-            # Fortsätt med nästa topic i stället för att krascha hela körningen
             continue
 
-        # Bygg upp HTML-body
         points = "".join([
             f"<li><a href='{s['link']}' target='_blank' rel='nofollow noopener'>{s['title']}</a></li>"
             for s in snippets
@@ -130,12 +134,7 @@ def main():
         """
 
         try:
-            res = wp_post_trend(
-                title=topic,
-                body=body,
-                topics=["idag", "svenska-trender"],
-                excerpt=summary[:140]
-            )
+            res = wp_post_trend(title=topic, body=body, topics=["idag", "svenska-trender"], excerpt=summary[:140])
             print("✅ Postad:", res)
             time.sleep(random.uniform(0.8, 1.6))
         except Exception as e:
