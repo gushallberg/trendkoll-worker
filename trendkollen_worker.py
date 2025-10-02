@@ -1,14 +1,15 @@
-import os, time, random, requests, json, feedparser, urllib.request
+import os, time, random, requests, json
 from datetime import datetime
 from urllib.parse import quote
+import feedparser
 from dotenv import load_dotenv
 
 load_dotenv()
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-WP_BASE_URL    = os.getenv("WP_BASE_URL")
-WP_USER        = os.getenv("WP_USER")
-WP_APP_PASS    = os.getenv("WP_APP_PASS")
+WP_BASE_URL    = os.getenv("WP_BASE_URL")      # ex: https://trendkoll.se
+WP_USER        = os.getenv("WP_USER")          # WP-användare
+WP_APP_PASS    = os.getenv("WP_APP_PASS")      # Application Password
 MAX_TRENDS     = int(os.getenv("MAX_TRENDS", "5"))
 
 UA_HEADERS = {
@@ -16,8 +17,9 @@ UA_HEADERS = {
                   "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 }
 
+# ---------- RSS helpers ----------
+
 def fetch_rss(url):
-    """Hämta RSS med headers och returnera feedparser-parsning."""
     try:
         r = requests.get(url, headers=UA_HEADERS, timeout=15)
         r.raise_for_status()
@@ -28,29 +30,14 @@ def fetch_rss(url):
 
 def get_trending_topics(max_items=5):
     """
-    Försök i ordning:
-    1) Google Trends daily RSS, Sverige (SE)
-    2) Google Trends daily RSS, Sverige med engelsk locale
-    3) Google Trends daily RSS, USA (US)
-    4) Fallback: Google News huvudflöde för Sverige (tar rubriker som topics)
+    Google Trends daily RSS ger 404 nu; vi kör direkt på Google News SE som topics-källa.
     """
-    urls = [
-        "https://trends.google.com/trends/trendingsearches/daily/rss?geo=SE",
-        "https://trends.google.com/trends/trendingsearches/daily/rss?geo=SE&hl=en-US",
-        "https://trends.google.com/trends/trendingsearches/daily/rss?geo=US&hl=en-US",
-    ]
-    for u in urls:
-        feed = fetch_rss(u)
-        topics = [e.title for e in feed.entries[:max_items]] if feed.entries else []
-        if topics:
-            print("✅ Hämtade topics från:", u)
-            return topics
-
-    # Sista fallback – Google News Sverige (tar rubriker som topics)
     gnews = fetch_rss("https://news.google.com/rss?hl=sv-SE&gl=SE&ceid=SE:sv")
-    topics = [e.title for e in gnews.entries[:max_items]] if gnews.entries else []
+    topics = [e.title for e in (gnews.entries or [])[:max_items]]
     if topics:
-        print("✅ Fallback: tog topics från Google News huvudflöde (SE)")
+        print("✅ Topics från Google News SE")
+    else:
+        print("⚠️ Inga topics i Google News.")
     return topics
 
 def gnews_snippets_sv(query, max_items=3):
@@ -65,36 +52,44 @@ def gnews_snippets_sv(query, max_items=3):
         })
     return items
 
-def openai_summarize(topic, snippets):
-    import os, json, urllib.request
-    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+# ---------- OpenAI helper ----------
 
+def openai_chat_summarize(topic, snippets, model="gpt-5"):
+    """
+    Använder Chat Completions API med gpt-5 (fallback: gpt-5-mini).
+    Returnerar ren text (ingen markdown).
+    """
     system = (
         "Du är en svensk nyhetsredaktör. Skriv en kort sammanfattning (120–180 ord) "
-        "om varför ämnet trendar nu. Rubrik överst, sedan 2–3 punktlistor, avsluta med 1–2 affiliate-idéer. "
-        "Ingen markdown, bara ren text."
+        "om varför ämnet trendar just nu. Börja med en rubrik (en rad), skriv sedan "
+        "2–3 punktlistor med de viktigaste orsakerna, och avsluta med 1–2 relevanta "
+        "affiliate-idéer. Ingen markdown, bara ren text med radbrytningar."
     )
     snip = "; ".join([f"{s['title']} ({s['link']})" for s in snippets]) if snippets else "Inga källsnuttar"
 
-    data = json.dumps({
-        "model": "gpt-5-mini",
-        "input": [
+    payload = {
+        "model": model,
+        "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": f"Ämne: {topic}\nNyhetssnuttar: {snip}"}
-        ]
-    }).encode("utf-8")
+        ],
+        "temperature": 0.4
+    }
 
-    req = urllib.request.Request(
-        "https://api.openai.com/v1/responses",
-        data=data,
-        headers={"Content-Type": "application/json", "Authorization": f"Bearer {OPENAI_API_KEY}"}
+    resp = requests.post(
+        "https://api.openai.com/v1/chat/completions",
+        headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+        json=payload, timeout=60
     )
-    with urllib.request.urlopen(req) as r:
-        out = r.read().decode("utf-8")
-    j = json.loads(out)
-    # Responses API: hämta texten så här:
-    return j["output"][0]["content"][0]["text"]
+    try:
+        resp.raise_for_status()
+    except requests.HTTPError:
+        print("OpenAI response text:", (resp.text or "")[:800])
+        raise
+    j = resp.json()
+    return j["choices"][0]["message"]["content"].strip()
 
+# ---------- WP helper ----------
 
 def wp_post_trend(title, body, topics=None, excerpt=""):
     url = f"{WP_BASE_URL}/wp-json/trendkollen/v1/ingest"
@@ -103,23 +98,37 @@ def wp_post_trend(title, body, topics=None, excerpt=""):
     resp.raise_for_status()
     return resp.json()
 
+# ---------- Main ----------
+
 def main():
     print("🔎 Startar Trendkoll-worker...")
     print("BASE_URL:", WP_BASE_URL, "| USER:", WP_USER)
 
     topics = get_trending_topics(MAX_TRENDS)
     if not topics:
-        print("⚠️ Hittade fortfarande inga topics. Avbryter.")
+        print("⚠️ Hittade inga topics. Avbryter.")
         return
 
     for topic in topics:
         print(f"➡️  Ämne: {topic}")
         snippets = gnews_snippets_sv(topic, max_items=4)
+
+        # Försök GPT-5 → fallback till 5-mini → sista fallback: no-AI
         try:
-            summary = openai_summarize(topic, snippets)
-        except Exception as e:
-            print("❌ OpenAI-fel:", e)
-            continue
+            try:
+                summary = openai_chat_summarize(topic, snippets, model="gpt-5")
+            except Exception as e1:
+                print("⚠️ gpt-5 fail, testar gpt-5-mini →", e1)
+                summary = openai_chat_summarize(topic, snippets, model="gpt-5-mini")
+        except Exception as e2:
+            print("❌ OpenAI-fel, kör no-AI fallback:", e2)
+            bullets = "\n".join([f"- {s['title']}" for s in snippets[:3]]) if snippets else "- Ingen nyhetskälla tillgänglig"
+            summary = (
+                f"{topic}\n\n"
+                "Viktiga punkter:\n"
+                f"{bullets}\n\n"
+                "Affiliate-idéer: Sök efter relaterade produkter/tjänster hos dina partnernätverk."
+            )
 
         points = "".join([
             f"<li><a href='{s['link']}' target='_blank' rel='nofollow noopener'>{s['title']}</a></li>"
@@ -137,7 +146,12 @@ def main():
         """
 
         try:
-            res = wp_post_trend(title=topic, body=body, topics=["idag", "svenska-trender"], excerpt=summary[:140])
+            res = wp_post_trend(
+                title=topic,
+                body=body,
+                topics=["idag", "svenska-trender"],
+                excerpt=summary[:140]
+            )
             print("✅ Postad:", res)
             time.sleep(random.uniform(0.8, 1.6))
         except Exception as e:
@@ -147,6 +161,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
