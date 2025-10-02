@@ -75,7 +75,7 @@ def openai_summarize(topic, snippets):
     snip = "; ".join([f"{s['title']} ({s['link']})" for s in snippets]) if snippets else "Inga källsnuttar"
 
     payload = {
-        "model": "gpt-5.1-mini",
+        "model": "gpt-5",
         "input": [
             {"role": "system", "content": system},
             {"role": "user", "content": f"Ämne: {topic}\nNyhetssnuttar: {snip}"}
@@ -144,3 +144,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
