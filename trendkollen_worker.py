@@ -4,6 +4,7 @@ from urllib.parse import quote
 from html import escape, unescape
 import feedparser
 from dotenv import load_dotenv
+from requests.exceptions import ReadTimeout, HTTPError, RequestException
 
 load_dotenv()
 
@@ -11,23 +12,68 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 WP_BASE_URL    = os.getenv("WP_BASE_URL")
 WP_USER        = os.getenv("WP_USER")
 WP_APP_PASS    = os.getenv("WP_APP_PASS")
-MAX_TRENDS     = int(os.getenv("MAX_TRENDS", "6"))  # hur många totalt (vi väljer per kategori nedan)
+MAX_TRENDS     = int(os.getenv("MAX_TRENDS", "7"))  # totala målämnen per körning
 
 UA_HEADERS = {
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 }
 
-# ----- Kategorier & källor -----
-# slug = vad som lagras i WP-taxonomin trend_category
+# --------- Kategorier & kvoter ---------
+# slug = vad som lagras som term i WP-taxonomin trend_category
 CATEGORIES = [
-    {"slug": "nyheter",       "name": "Nyheter",        "query": "Sverige"},
-    {"slug": "sport",         "name": "Sport",          "query": "fotboll OR ishockey OR allsvenskan OR SHL OR Premier League OR landslaget"},
-    {"slug": "teknik-prylar", "name": "Teknik & Prylar","query": "smartphone OR lansering OR \"ny mobil\" OR pryl OR teknik"},
-    {"slug": "underhallning", "name": "Underhållning",  "query": "film OR serie OR streaming OR musik OR kändis OR influencer"},
-    {"slug": "ekonomi-bors",  "name": "Ekonomi & Börs", "query": "börsen OR aktier OR inflation OR ränta OR Riksbanken"},
-    {"slug": "gaming-esport", "name": "Gaming & e-sport","query": "gaming OR e-sport OR playstation OR xbox OR nintendo OR steam"},
-    {"slug": "viralt-trend",  "name": "Viralt & Trendord","query": "tiktok OR viralt OR meme OR trend OR hashtag"},
+    {"slug": "nyheter",        "name": "Nyheter",         "query": "Sverige"},
+    {"slug": "sport",          "name": "Sport",           "query": "Allsvenskan OR SHL OR Premier League Sverige OR Champions League Sverige OR landslaget"},
+    {"slug": "teknik-prylar",  "name": "Teknik & Prylar", "query": "smartphone OR lansering OR 'ny mobil' OR pryl OR teknik"},
+    {"slug": "prylradar",      "name": "Prylradar",       "query": "lansering OR släpper OR release OR uppdatering OR recension teknik pryl gadget"},
+    {"slug": "underhallning",  "name": "Underhållning",   "query": "film OR serie OR streaming OR musik OR kändis OR influencer"},
+    {"slug": "ekonomi-bors",   "name": "Ekonomi & Börs",  "query": "börsen OR aktier OR inflation OR ränta OR Riksbanken"},
+    {"slug": "gaming-esport",  "name": "Gaming & e-sport","query": "gaming OR e-sport OR playstation OR xbox OR nintendo OR steam"},
+    {"slug": "viralt-trend",   "name": "Viralt & Trendord","query": "tiktok OR viralt OR meme OR trend OR hashtag"},
 ]
+
+# hur många ämnen per kategori (försöker uppfylla kvoterna, totalt begränsas också av MAX_TRENDS)
+CATEGORY_QUOTA = {
+    "nyheter": 1,
+    "sport": 1,
+    "teknik-prylar": 1,
+    "prylradar": 1,
+    "underhallning": 1,
+    "ekonomi-bors": 1,
+    "gaming-esport": 1,
+    "viralt-trend": 1,
+}
+
+# extra källor/queries per kategori
+SPORT_QUERIES = [
+    "Allsvenskan",
+    "SHL",
+    "Premier League Sverige",
+    "Champions League Sverige",
+    "Damallsvenskan",
+    "Landslaget fotboll",
+    "Tre Kronor",
+]
+
+PRYL_QUERIES = [
+    "lansering smartphone",
+    "\"ny mobil\"",
+    "iPhone lansering",
+    "Samsung släpper",
+    "smartwatch lansering",
+    "AI-kamera lansering",
+    "RTX grafikkort",
+    "Playstation uppdatering",
+]
+
+PRYL_FEEDS = [
+    # internationella tech-feeds (om någon 404:ar är det lugnt – vi fångar det)
+    "https://www.gsmarena.com/rss-news-reviews.php3",
+    "https://www.theverge.com/rss/index.xml",
+    "https://www.engadget.com/rss.xml",
+    "https://www.techradar.com/rss",
+]
+
+# --------- RSS helpers ---------
 
 def fetch_rss(url):
     try:
@@ -43,7 +89,25 @@ def gnews_titles(query, max_items=6):
     feed = fetch_rss(url)
     return [e.title for e in (feed.entries or [])[:max_items]]
 
+def prylradar_titles(max_items=10):
+    titles = []
+    # Feeds
+    for u in PRYL_FEEDS:
+        feed = fetch_rss(u)
+        titles.extend([e.title for e in (feed.entries or [])[:max_items//2]])
+        if len(titles) >= max_items:
+            break
+    # GNews queries
+    for q in PRYL_QUERIES:
+        titles.extend(gnews_titles(q, max_items=3))
+        if len(titles) >= max_items:
+            break
+    return titles[:max_items]
+
+# --------- Text helpers ---------
+
 def clean_topic_title(t: str) -> str:
+    # Ta bort onödiga prefix/suffix (t.ex. "JUST NU:", "DN Direkt -", och källnamn på slutet)
     t = t.strip()
     t = re.sub(r'^(JUST NU:|DN Direkt\s*-\s*|LIVE:)\s*', '', t, flags=re.I)
     t = re.sub(r'\s+[–-]\s+[^\-–—|:]{2,}$', '', t).strip()
@@ -78,6 +142,8 @@ def text_to_html(txt: str) -> str:
     flush_bullets()
     return "\n".join(parts) if parts else "<p></p>"
 
+# --------- OpenAI (GPT-5) ---------
+
 def openai_chat_summarize(topic, snippets, model="gpt-5"):
     system = (
         "Du är en svensk nyhetsredaktör. Skriv en kort sammanfattning (120–180 ord) "
@@ -107,15 +173,34 @@ def openai_chat_summarize(topic, snippets, model="gpt-5"):
     j = resp.json()
     return j["choices"][0]["message"]["content"].strip()
 
+def summarize_with_retries(topic, snippets):
+    """Försök gpt-5 → gpt-5-mini, två försök per modell, backoff vid timeout."""
+    models = ["gpt-5", "gpt-5-mini"]
+    for model in models:
+        for attempt in range(2):
+            try:
+                return openai_chat_summarize(topic, snippets, model=model)
+            except ReadTimeout:
+                wait = 2 ** attempt
+                print(f"⏳ OpenAI timeout ({model}) – försöker igen om {wait}s...")
+                time.sleep(wait)
+                continue
+            except HTTPError as e:
+                print("OpenAI HTTPError:", e)
+                break
+            except RequestException as e:
+                print("OpenAI RequestException:", e)
+                break
+            except Exception as e:
+                print("OpenAI annat fel:", e)
+                break
+    raise Exception("Alla modellförsök misslyckades")
+
+# --------- WordPress helpers ---------
+
 def wp_post_trend(title, body, topics=None, categories=None, excerpt=""):
     url = f"{WP_BASE_URL}/wp-json/trendkollen/v1/ingest"
-    payload = {
-        "title": title,
-        "content": body,
-        "excerpt": excerpt,
-        "topics": topics or [],
-        "categories": categories or []
-    }
+    payload = {"title": title, "content": body, "excerpt": excerpt, "topics": topics or [], "categories": categories or []}
     resp = requests.post(url, json=payload, auth=(WP_USER, WP_APP_PASS), timeout=30)
     resp.raise_for_status()
     return resp.json()
@@ -139,37 +224,58 @@ def wp_trend_exists_exact(title, within_hours=24):
                 return True
     return False
 
+# --------- Urval: mix per kategori ---------
+
 def pick_diverse_topics(max_total):
-    """Hämta ett ämne per kategori (i ordning), tills vi når max_total."""
+    """Välj ämnen enligt CATEGORY_QUOTA, undvik dubbletter, fyll upp från Nyheter."""
     seen = set()
-    topics = []
+    picked = []
     for cat in CATEGORIES:
-        if len(topics) >= max_total: break
-        titles = gnews_titles(cat["query"], max_items=8)
-        for t in titles:
+        quota = CATEGORY_QUOTA.get(cat["slug"], 0)
+        if quota <= 0: 
+            continue
+
+        # Källa per kategori
+        titles_pool = []
+        if cat["slug"] == "sport":
+            for q in SPORT_QUERIES:
+                titles_pool.extend(gnews_titles(q, max_items=4))
+        elif cat["slug"] == "prylradar":
+            titles_pool.extend(prylradar_titles(max_items=12))
+        else:
+            titles_pool.extend(gnews_titles(cat["query"], max_items=10))
+
+        # Välj upp till quota unika
+        count = 0
+        for t in titles_pool:
+            if len(picked) >= max_total: break
             clean = clean_topic_title(t)
             if not clean or clean.lower() in seen: continue
-            topics.append({"title": clean, "cat_slug": cat["slug"], "cat_name": cat["name"]})
+            picked.append({"title": clean, "cat_slug": cat["slug"], "cat_name": cat["name"]})
             seen.add(clean.lower())
-            break
-    # Om färre än max_total (pga tomma källor), fyll på från Nyheter
-    if len(topics) < max_total:
-        extra = gnews_titles("Sverige", max_items=12)
+            count += 1
+            if count >= quota: break
+
+        if len(picked) >= max_total: break
+
+    # Fyll på från Nyheter om vi saknar ämnen
+    if len(picked) < max_total:
+        extra = gnews_titles("Sverige", max_items=24)
         for t in extra:
-            if len(topics) >= max_total: break
+            if len(picked) >= max_total: break
             clean = clean_topic_title(t)
             if clean and clean.lower() not in seen:
-                topics.append({"title": clean, "cat_slug": "nyheter", "cat_name": "Nyheter"})
+                picked.append({"title": clean, "cat_slug": "nyheter", "cat_name": "Nyheter"})
                 seen.add(clean.lower())
-    return topics
+    return picked
+
+# --------- Main ---------
 
 def main():
     print("🔎 Startar Trendkoll-worker...")
     print("BASE_URL:", WP_BASE_URL, "| USER:", WP_USER)
 
     date_tag = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-    # Välj ämnen med mix av kategorier
     bundles = pick_diverse_topics(max_total=MAX_TRENDS)
     if not bundles:
         print("⚠️ Hittade inga topics. Avbryter.")
@@ -193,11 +299,7 @@ def main():
 
         # GPT-5 → 5-mini → no-AI fallback
         try:
-            try:
-                raw_summary = openai_chat_summarize(title, snippets, model="gpt-5")
-            except Exception as e1:
-                print("⚠️ gpt-5 fail, testar gpt-5-mini →", e1)
-                raw_summary = openai_chat_summarize(title, snippets, model="gpt-5-mini")
+            raw_summary = summarize_with_retries(title, snippets)
         except Exception as e2:
             print("❌ OpenAI-fel, kör no-AI fallback:", e2)
             bullets = "\n".join([f"- {s['title']}" for s in snippets[:3]]) if snippets else "- Ingen nyhetskälla tillgänglig"
