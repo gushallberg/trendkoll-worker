@@ -1,6 +1,7 @@
 import os, time, random, requests, json
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from urllib.parse import quote
+from html import unescape
 import feedparser
 from dotenv import load_dotenv
 
@@ -8,7 +9,7 @@ load_dotenv()
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 WP_BASE_URL    = os.getenv("WP_BASE_URL")      # ex: https://trendkoll.se
-WP_USER        = os.getenv("WP_USER")          # WP-användare
+WP_USER        = os.getenv("WP_USER")          # WP-användare (samma som App Password skapades för)
 WP_APP_PASS    = os.getenv("WP_APP_PASS")      # Application Password
 MAX_TRENDS     = int(os.getenv("MAX_TRENDS", "5"))
 
@@ -30,10 +31,11 @@ def fetch_rss(url):
 
 def get_trending_topics(max_items=5):
     """
-    Google Trends daily RSS ger 404 nu; vi kör direkt på Google News SE som topics-källa.
+    Hämtar rubriker från Google News huvudflöde för Sverige och använder dem som topics.
+    Stabilt och enkelt att köra schemalagt.
     """
-    gnews = fetch_rss("https://news.google.com/rss?hl=sv-SE&gl=SE&ceid=SE:sv")
-    topics = [e.title for e in (gnews.entries or [])[:max_items]]
+    feed = fetch_rss("https://news.google.com/rss?hl=sv-SE&gl=SE&ceid=SE:sv")
+    topics = [e.title for e in (feed.entries or [])[:max_items]]
     if topics:
         print("✅ Topics från Google News SE")
     else:
@@ -52,12 +54,12 @@ def gnews_snippets_sv(query, max_items=3):
         })
     return items
 
-# ---------- OpenAI helper ----------
+# ---------- OpenAI helper (GPT-5) ----------
 
 def openai_chat_summarize(topic, snippets, model="gpt-5"):
     """
-    Använder Chat Completions API med gpt-5 (fallback: gpt-5-mini).
-    Returnerar ren text (ingen markdown).
+    Chat Completions med GPT-5 (fallback: gpt-5-mini). Skicka INTE temperature för dessa modeller.
+    Returnerar ren text utan markdown.
     """
     system = (
         "Du är en svensk nyhetsredaktör. Skriv en kort sammanfattning (120–180 ord) "
@@ -72,8 +74,8 @@ def openai_chat_summarize(topic, snippets, model="gpt-5"):
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": f"Ämne: {topic}\nNyhetssnuttar: {snip}"}
-        ],
-        "temperature": 0.4
+        ]
+        # OBS: ingen 'temperature' – GPT-5/5-mini stödjer endast default
     }
 
     resp = requests.post(
@@ -89,14 +91,49 @@ def openai_chat_summarize(topic, snippets, model="gpt-5"):
     j = resp.json()
     return j["choices"][0]["message"]["content"].strip()
 
-# ---------- WP helper ----------
+# ---------- WordPress helpers ----------
 
 def wp_post_trend(title, body, topics=None, excerpt=""):
+    """
+    Postar via vårt Trendkollen-endpoint (kräver att pluginet är aktivt i Live).
+    """
     url = f"{WP_BASE_URL}/wp-json/trendkollen/v1/ingest"
     payload = {"title": title, "content": body, "excerpt": excerpt, "topics": topics or []}
     resp = requests.post(url, json=payload, auth=(WP_USER, WP_APP_PASS), timeout=30)
     resp.raise_for_status()
     return resp.json()
+
+def wp_trend_exists_exact(title, within_hours=24):
+    """
+    Kollar via WP REST (CPT: trend) om det redan finns ett inlägg
+    med exakt samma titel de senaste 'within_hours' timmarna.
+    """
+    try:
+        url = f"{WP_BASE_URL}/wp-json/wp/v2/trend?search={quote(title)}&per_page=10&orderby=date&order=desc"
+        resp = requests.get(url, auth=(WP_USER, WP_APP_PASS), timeout=20)
+        resp.raise_for_status()
+        posts = resp.json()
+    except Exception as e:
+        print("⚠️ Kunde inte läsa WP-lista för duplikat:", e)
+        return False
+
+    now = datetime.now(timezone.utc)
+    for p in posts:
+        rendered = unescape(p.get("title", {}).get("rendered", "")).strip()
+        if rendered.lower() == title.strip().lower():
+            # datum i UTC
+            date_gmt = p.get("date_gmt")
+            if date_gmt:
+                try:
+                    dt = datetime.fromisoformat(date_gmt.replace("Z", "+00:00"))
+                except Exception:
+                    dt = now  # om parse faller
+            else:
+                dt = now
+            age = now - dt
+            if age <= timedelta(hours=within_hours):
+                return True
+    return False
 
 # ---------- Main ----------
 
@@ -109,35 +146,53 @@ def main():
         print("⚠️ Hittade inga topics. Avbryter.")
         return
 
+    posted_titles = set()
+    date_tag = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
     for topic in topics:
-        print(f"➡️  Ämne: {topic}")
-        snippets = gnews_snippets_sv(topic, max_items=4)
+        topic_clean = topic.strip()
+        if topic_clean.lower() in (t.lower() for t in posted_titles):
+            print("⏭️ Hoppar över (dubblett i samma körning):", topic_clean)
+            continue
+
+        # Duplikatskydd mot tidigare publicerad titel
+        if wp_trend_exists_exact(topic_clean, within_hours=24):
+            print("⏭️ Hoppar över (fanns redan senaste 24h i WP):", topic_clean)
+            continue
+
+        print(f"➡️  Ämne: {topic_clean}")
+        snippets = gnews_snippets_sv(topic_clean, max_items=4)
 
         # Försök GPT-5 → fallback till 5-mini → sista fallback: no-AI
         try:
             try:
-                summary = openai_chat_summarize(topic, snippets, model="gpt-5")
+                summary = openai_chat_summarize(topic_clean, snippets, model="gpt-5")
             except Exception as e1:
                 print("⚠️ gpt-5 fail, testar gpt-5-mini →", e1)
-                summary = openai_chat_summarize(topic, snippets, model="gpt-5-mini")
+                summary = openai_chat_summarize(topic_clean, snippets, model="gpt-5-mini")
         except Exception as e2:
             print("❌ OpenAI-fel, kör no-AI fallback:", e2)
             bullets = "\n".join([f"- {s['title']}" for s in snippets[:3]]) if snippets else "- Ingen nyhetskälla tillgänglig"
             summary = (
-                f"{topic}\n\n"
+                f"{topic_clean}\n\n"
                 "Viktiga punkter:\n"
                 f"{bullets}\n\n"
                 "Affiliate-idéer: Sök efter relaterade produkter/tjänster hos dina partnernätverk."
             )
 
-        points = "".join([
-            f"<li><a href='{s['link']}' target='_blank' rel='nofollow noopener'>{s['title']}</a></li>"
-            for s in snippets
-        ]) if snippets else "<li>(Inga källor tillgängliga just nu)</li>"
+        # HTML-body
+        published_str = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')
+        if snippets:
+            points = "".join([
+                f"<li><a href='{s['link']}' target='_blank' rel='nofollow noopener'>{s['title']}</a></li>"
+                for s in snippets
+            ])
+        else:
+            points = "<li>(Inga källor tillgängliga just nu)</li>"
 
         body = f"""
-        <h2>{topic}</h2>
-        <p><em>Publicerad: {datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC</em></p>
+        <h2>{topic_clean}</h2>
+        <p><em>Publicerad: {published_str} UTC</em></p>
         <div class='tk-summary'>
 {summary}
         </div>
@@ -147,11 +202,12 @@ def main():
 
         try:
             res = wp_post_trend(
-                title=topic,
+                title=topic_clean,
                 body=body,
-                topics=["idag", "svenska-trender"],
+                topics=["idag", "svenska-trender", date_tag],  # datum-tagg
                 excerpt=summary[:140]
             )
+            posted_titles.add(topic_clean)
             print("✅ Postad:", res)
             time.sleep(random.uniform(0.8, 1.6))
         except Exception as e:
