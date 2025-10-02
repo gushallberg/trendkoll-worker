@@ -206,6 +206,10 @@ def wp_post_trend(title, body, topics=None, categories=None, excerpt=""):
     return resp.json()
 
 def wp_trend_exists_exact(title, within_hours=24):
+    """
+    Kolla om samma titel redan finns senaste dygnet (CPT: trend).
+    Tvingar alla datum till timezone-aware UTC för att undvika TypeError.
+    """
     try:
         url = f"{WP_BASE_URL}/wp-json/wp/v2/trend?search={quote(title)}&per_page=10&orderby=date&order=desc"
         resp = requests.get(url, auth=(WP_USER, WP_APP_PASS), timeout=20)
@@ -214,15 +218,36 @@ def wp_trend_exists_exact(title, within_hours=24):
     except Exception as e:
         print("⚠️ Kunde inte läsa WP-lista för duplikat:", e)
         return False
+
+    def _parse_wp_dt(p):
+        # WP kan ge t.ex. "2025-10-02T08:50:12" (utan Z) eller med "Z"
+        raw_gmt = p.get("date_gmt") or ""
+        raw_loc = p.get("date") or ""
+        for s in (raw_gmt, raw_loc):
+            if not s:
+                continue
+            try:
+                dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+                # Saknas tzinfo → anta UTC
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                else:
+                    dt = dt.astimezone(timezone.utc)
+                return dt
+            except Exception:
+                continue
+        # Sista utväg: nu (UTC)
+        return datetime.now(timezone.utc)
+
     now = datetime.now(timezone.utc)
     for p in posts:
         rendered = unescape(p.get("title", {}).get("rendered", "")).strip()
         if rendered.lower() == title.strip().lower():
-            date_gmt = p.get("date_gmt")
-            dt = datetime.fromisoformat(date_gmt.replace("Z", "+00:00")) if date_gmt else now
+            dt = _parse_wp_dt(p)
             if (now - dt) <= timedelta(hours=within_hours):
                 return True
     return False
+
 
 # --------- Urval: mix per kategori ---------
 
@@ -339,3 +364,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
