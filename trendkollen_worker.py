@@ -1,6 +1,6 @@
-import os, time, random, requests, json, re
+import os, time, random, requests, json, re, unicodedata
 from datetime import datetime, timezone, timedelta
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 from html import escape, unescape
 import feedparser
 from dotenv import load_dotenv
@@ -12,9 +12,9 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 WP_BASE_URL    = os.getenv("WP_BASE_URL")
 WP_USER        = os.getenv("WP_USER")
 WP_APP_PASS    = os.getenv("WP_APP_PASS")
-MAX_TRENDS     = int(os.getenv("MAX_TRENDS", "7"))
+MAX_TRENDS     = int(os.getenv("MAX_TRENDS", "8"))  # gärna 8 för att rymma alla kvoter
 
-# Optional YouTube API (för viralt/nöjen)
+# YouTube är VALFRITT. Fyll i YT_API_KEY i Render om du vill använda.
 YT_API_KEY     = os.getenv("YT_API_KEY", "").strip()
 YT_REGION      = os.getenv("YT_REGION", "SE").strip() or "SE"
 
@@ -22,31 +22,34 @@ UA_HEADERS = {
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 }
 
-# --------- Kategorier, kvoter, queries ---------
+# ----- Konfig: kategorier, kvoter, queries -----
+# Prioritetsordning: säkerställer att VIRALT & UNDERHÅLLNING alltid tas med
 CATEGORIES = [
-    {"slug": "nyheter",        "name": "Nyheter",         "query": "Sverige"},
-    {"slug": "sport",          "name": "Sport",           "query": "Allsvenskan OR SHL OR Premier League Sverige OR Champions League Sverige OR landslaget"},
-    {"slug": "teknik-prylar",  "name": "Teknik & Prylar", "query": "smartphone OR lansering OR 'ny mobil' OR pryl OR teknik"},
-    {"slug": "prylradar",      "name": "Prylradar",       "query": "lansering OR släpper OR release OR uppdatering OR recension teknik pryl gadget"},
-    {"slug": "underhallning",  "name": "Underhållning",   "query": "film OR serie OR streaming OR musik OR kändis OR influencer"},
-    {"slug": "ekonomi-bors",   "name": "Ekonomi & Börs",  "query": "börsen OR aktier OR inflation OR ränta OR Riksbanken"},
-    {"slug": "gaming-esport",  "name": "Gaming & e-sport","query": "gaming OR e-sport OR playstation OR xbox OR nintendo OR steam"},
-    {"slug": "viralt-trend",   "name": "Viralt & Trendord","query": "tiktok OR viralt OR meme OR trend OR hashtag"},
+    {"slug": "viralt-trend",   "name": "Viralt & Trendord", "query": "tiktok OR viralt OR meme OR trend OR hashtag"},
+    {"slug": "underhallning",  "name": "Underhållning",     "query": "film OR serie OR streaming OR musik OR kändis OR influencer"},
+    {"slug": "sport",          "name": "Sport",             "query": "Allsvenskan OR SHL OR Premier League Sverige OR Champions League Sverige OR landslaget"},
+    {"slug": "prylradar",      "name": "Prylradar",         "query": "lansering OR släpper OR release OR uppdatering OR recension teknik pryl gadget"},
+    {"slug": "teknik-prylar",  "name": "Teknik & Prylar",   "query": "smartphone OR lansering OR 'ny mobil' OR pryl OR teknik"},
+    {"slug": "ekonomi-bors",   "name": "Ekonomi & Börs",    "query": "börsen OR aktier OR inflation OR ränta OR Riksbanken"},
+    {"slug": "nyheter",        "name": "Nyheter",           "query": "Sverige"},
+    {"slug": "gaming-esport",  "name": "Gaming & e-sport",  "query": "gaming OR e-sport OR playstation OR xbox OR nintendo OR steam"},
 ]
 
+# hur många ämnen per kategori (summa ≈ MAX_TRENDS)
 CATEGORY_QUOTA = {
-    "nyheter": 1, "sport": 1, "teknik-prylar": 1, "prylradar": 1,
-    "underhallning": 1, "ekonomi-bors": 1, "gaming-esport": 1, "viralt-trend": 1,
+    "viralt-trend": 1,
+    "underhallning": 1,
+    "sport": 1,
+    "prylradar": 1,
+    "teknik-prylar": 1,
+    "ekonomi-bors": 1,
+    "nyheter": 1,
+    "gaming-esport": 1,
 }
 
 SPORT_QUERIES = [
-    "Allsvenskan",
-    "SHL",
-    "Premier League Sverige",
-    "Champions League Sverige",
-    "Damallsvenskan",
-    "Landslaget fotboll",
-    "Tre Kronor",
+    "Allsvenskan", "SHL", "Premier League Sverige", "Champions League Sverige",
+    "Damallsvenskan", "Landslaget fotboll", "Tre Kronor"
 ]
 
 PRYL_QUERIES = [
@@ -61,7 +64,49 @@ PRYL_FEEDS = [
     "https://www.techradar.com/rss",
 ]
 
-# --------- RSS / API helpers ---------
+# ----- Datum/recency helpers -----
+def _to_aware_utc(dt: datetime) -> datetime:
+    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+
+def parse_entry_dt(entry) -> datetime | None:
+    # feedparser ger ibland published_parsed (struct_time)
+    if getattr(entry, "published_parsed", None):
+        try:
+            dt = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
+            return dt
+        except Exception:
+            pass
+    # annars free text
+    for k in ("published", "updated", "pubDate"):
+        s = getattr(entry, k, None) or (entry.get(k) if isinstance(entry, dict) else None)
+        if s:
+            try:
+                # grov parse – feedparser har redan gjort sitt bästa; fallback, anta UTC
+                return datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(timezone.utc)
+            except Exception:
+                continue
+    return None
+
+def is_recent(dt: datetime | None, max_age_hours=48) -> bool:
+    if not dt:
+        return False
+    return (_to_aware_utc(datetime.now(timezone.utc)) - _to_aware_utc(dt)) <= timedelta(hours=max_age_hours)
+
+# ----- String normalisering (dubblettskydd) -----
+def normalize_title_key(s: str) -> str:
+    # NFKD, ta bort accenter, ersätt typografiska tecken, ta bort icke-alfanumeriskt
+    s = s.strip().lower()
+    repl = {
+        "’": "'", "‘": "'", "“": '"', "”": '"', "–": "-", "—": "-", "-": "-", "–": "-",
+    }
+    for a,b in repl.items():
+        s = s.replace(a,b)
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if ch.isalnum() or ch.isspace())
+    s = re.sub(r"\s+", " ", s)
+    return s.strip()
+
+# ----- RSS / API helpers -----
 def fetch_rss(url):
     try:
         r = requests.get(url, headers=UA_HEADERS, timeout=15)
@@ -71,33 +116,52 @@ def fetch_rss(url):
         print("⚠️ RSS-fel på", url, "→", e)
         return feedparser.FeedParserDict(entries=[])
 
-def gnews_titles(query, max_items=6):
-    url = f"https://news.google.com/rss/search?q={quote(query)}&hl=sv-SE&gl=SE&ceid=SE:sv"
+def gnews_recent_titles(query, max_items=6, max_age_hours=48):
+    # använd when:2d + filtrera på published
+    q = f"{query} when:2d"
+    url = f"https://news.google.com/rss/search?q={quote(q)}&hl=sv-SE&gl=SE&ceid=SE:sv"
     feed = fetch_rss(url)
-    return [e.title for e in (feed.entries or [])[:max_items]]
+    titles = []
+    for e in (feed.entries or []):
+        dt = parse_entry_dt(e)
+        if not is_recent(dt, max_age_hours=max_age_hours):
+            continue
+        titles.append(e.title)
+        if len(titles) >= max_items:
+            break
+    return titles
 
-def gnews_snippets_sv(query, max_items=3):
-    url = f"https://news.google.com/rss/search?q={quote(query)}&hl=sv-SE&gl=SE&ceid=SE:sv"
+def gnews_snippets_sv(query, max_items=3, max_age_hours=72):
+    q = f"{query} when:3d"
+    url = f"https://news.google.com/rss/search?q={quote(q)}&hl=sv-SE&gl=SE&ceid=SE:sv"
     feed = fetch_rss(url)
     items = []
-    for entry in (feed.entries or [])[:max_items]:
+    for entry in (feed.entries or []):
+        dt = parse_entry_dt(entry)
+        if not is_recent(dt, max_age_hours=max_age_hours):
+            continue
         items.append({"title": entry.title, "link": entry.link, "published": entry.get("published", "")})
+        if len(items) >= max_items:
+            break
     return items
 
-def prylradar_titles(max_items=12):
+def prylradar_items(max_items=12, max_age_days=14):
     items = []
+    cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
     # Feeds
     for u in PRYL_FEEDS:
         feed = fetch_rss(u)
-        for e in (feed.entries or [])[: max_items // 2]:
-            items.append((e.title, getattr(e, "link", u)))
-            if len(items) >= max_items: break
+        for e in (feed.entries or []):
+            dt = parse_entry_dt(e)
+            if dt and dt >= cutoff:
+                items.append((e.title, getattr(e, "link", u)))
+            if len(items) >= max_items:
+                break
         if len(items) >= max_items: break
     # GNews queries
     for q in PRYL_QUERIES:
-        f = fetch_rss(f"https://news.google.com/rss/search?q={quote(q)}&hl=sv-SE&gl=SE&ceid=SE:sv")
-        for e in (f.entries or [])[:3]:
-            items.append((e.title, getattr(e, "link", "")))
+        for t in gnews_recent_titles(q, max_items=4, max_age_hours=max_age_days*24):
+            items.append((t, ""))  # origin okänd via gnews
             if len(items) >= max_items: break
         if len(items) >= max_items: break
     return items[:max_items]
@@ -140,7 +204,6 @@ def reddit_top_sweden(limit=10):
         return []
 
 def youtube_trending_titles(limit=10):
-    """Valfritt: kräver YT_API_KEY. Hämtar populära videor i regionen (SE default)."""
     if not YT_API_KEY:
         return []
     try:
@@ -157,7 +220,7 @@ def youtube_trending_titles(limit=10):
         print("⚠️ youtube_trending_titles fel:", e)
         return []
 
-# --------- Text helpers ---------
+# ----- Text helpers -----
 def clean_topic_title(t: str) -> str:
     t = t.strip()
     t = re.sub(r'^(JUST NU:|DN Direkt\s*-\s*|LIVE:)\s*', '', t, flags=re.I)
@@ -200,7 +263,7 @@ def text_to_html(txt: str) -> str:
     flush_bullets()
     return "\n".join(parts) if parts else "<p></p>"
 
-# --------- OpenAI (GPT-5) ---------
+# ----- OpenAI (GPT-5) -----
 def openai_chat_summarize(topic, snippets, model="gpt-5"):
     system = (
         "Skriv på svensk nyhetsprosa. 110–150 ord. Ingen rubrik.\n"
@@ -240,7 +303,7 @@ def summarize_with_retries(topic, snippets):
                 print("OpenAI annat fel:", e); break
     raise Exception("Alla modellförsök misslyckades")
 
-# --------- WordPress helpers ---------
+# ----- WordPress helpers -----
 def wp_post_trend(title, body, topics=None, categories=None, excerpt=""):
     url = f"{WP_BASE_URL}/wp-json/trendkollen/v1/ingest"
     payload = {"title": title,"content": body,"excerpt": excerpt,"topics": topics or [],"categories": categories or []}
@@ -269,32 +332,40 @@ def wp_trend_exists_exact(title, within_hours=24):
         return datetime.now(timezone.utc)
 
     now = datetime.now(timezone.utc)
+    want_key = normalize_title_key(title)
     for p in posts:
         rendered = unescape(p.get("title", {}).get("rendered", "")).strip()
-        if rendered.lower() == title.strip().lower():
+        have_key = normalize_title_key(rendered)
+        if have_key == want_key:
             dt = _parse_wp_dt(p)
             if (now - dt) <= timedelta(hours=within_hours): return True
     return False
 
-# --------- Urval: mix per kategori ---------
+# ----- Urval: mix per kategori -----
 def pick_diverse_topics(max_total):
-    seen = set(); picked = []
+    print(f"▶ YouTube {'ON' if YT_API_KEY else 'OFF'} (region {YT_REGION})")
+    seen_keys = set()
+    picked = []
     for cat in CATEGORIES:
         quota = CATEGORY_QUOTA.get(cat["slug"], 0)
         if quota <= 0: continue
 
-        titles_pool = []
+        titles_pool = []  # kan vara str eller (title, origin)
         if cat["slug"] == "sport":
-            for q in SPORT_QUERIES: titles_pool.extend(gnews_titles(q, max_items=4))
+            for q in SPORT_QUERIES:
+                titles_pool.extend(gnews_recent_titles(q, max_items=4, max_age_hours=72))
         elif cat["slug"] == "prylradar":
-            titles_pool.extend(prylradar_titles(max_items=12))  # (title, origin)
+            titles_pool.extend(prylradar_items(max_items=12, max_age_days=14))  # (title, origin)
         elif cat["slug"] == "viralt-trend":
-            pool = []; pool.extend(wiki_top_sv(limit=10)); pool.extend(reddit_top_sweden(limit=10))
-            # valfritt YouTube-trending (om API-nyckel finns)
-            pool.extend(youtube_trending_titles(limit=10))
-            titles_pool.extend(pool)  # bara titlar här
+            wiki = wiki_top_sv(limit=10)
+            reddit = reddit_top_sweden(limit=10)
+            yt = youtube_trending_titles(limit=10)
+            print(f"▶ Viralt pool: wiki={len(wiki)} reddit={len(reddit)} youtube={len(yt)}")
+            pool = []
+            pool.extend(wiki); pool.extend(reddit); pool.extend(yt)
+            titles_pool.extend(pool)
         else:
-            titles_pool.extend(gnews_titles(cat["query"], max_items=10))
+            titles_pool.extend(gnews_recent_titles(cat["query"], max_items=10, max_age_hours=48))
 
         count = 0
         for t in titles_pool:
@@ -304,26 +375,30 @@ def pick_diverse_topics(max_total):
             else:
                 raw_title, origin = t, ""
             clean = clean_topic_title(raw_title)
-            if not clean or clean.lower() in seen: continue
-            # svenskifiera teknik/prylar rubriker lite
-            if cat["slug"] in ("prylradar","teknik-prylar"): clean = swedishify_title_if_needed(clean)
+            if cat["slug"] in ("prylradar","teknik-prylar"):
+                clean = swedishify_title_if_needed(clean)
+            key = normalize_title_key(clean)
+            if not clean or key in seen_keys: continue
             picked.append({"title": clean, "cat_slug": cat["slug"], "cat_name": cat["name"], "origin": origin})
-            seen.add(clean.lower()); count += 1
+            seen_keys.add(key)
+            count += 1
             if count >= quota: break
 
         if len(picked) >= max_total: break
 
+    # Fyll på från Nyheter om vi saknar ämnen
     if len(picked) < max_total:
-        extra = gnews_titles("Sverige", max_items=24)
+        extra = gnews_recent_titles("Sverige", max_items=24, max_age_hours=48)
         for t in extra:
             if len(picked) >= max_total: break
             clean = clean_topic_title(t)
-            if clean and clean.lower() not in seen:
+            key = normalize_title_key(clean)
+            if clean and key not in seen_keys:
                 picked.append({"title": clean, "cat_slug": "nyheter", "cat_name": "Nyheter", "origin": ""})
-                seen.add(clean.lower())
+                seen_keys.add(key)
     return picked
 
-# --------- Main ---------
+# ----- Main -----
 def main():
     print("🔎 Startar Trendkoll-worker..."); print("BASE_URL:", WP_BASE_URL, "| USER:", WP_USER)
 
@@ -332,20 +407,22 @@ def main():
     if not bundles:
         print("⚠️ Hittade inga topics. Avbryter."); return
 
-    posted_now = set()
+    posted_now_keys = set()
 
     for b in bundles:
         title = b["title"]; cat = b["cat_slug"]; origin = b.get("origin") or ""
+        key = normalize_title_key(title)
         print(f"➡️  [{cat}] {title}")
 
-        if title.lower() in (t.lower() for t in posted_now):
+        if key in posted_now_keys:
             print("⏭️ Hoppar över (dubblett i samma körning)."); continue
         if wp_trend_exists_exact(title, within_hours=24):
             print("⏭️ Hoppar över (fanns redan senaste 24h i WP)."); continue
 
-        snippets = gnews_snippets_sv(title, max_items=4)
+        snippets = gnews_snippets_sv(title, max_items=4, max_age_hours=72)
         if not snippets and origin:
-            snippets = [{"title":"(Källa)","link":origin,"published":""}]
+            dom = urlparse(origin).netloc or "Källa"
+            snippets = [{"title": dom, "link": origin, "published": ""}]
 
         # GPT-5 → 5-mini → no-AI fallback
         try:
@@ -377,7 +454,7 @@ def main():
                 categories=[cat],
                 excerpt=make_excerpt(raw_summary, max_chars=160)
             )
-            posted_now.add(title); print("✅ Postad:", res)
+            posted_now_keys.add(key); print("✅ Postad:", res)
             time.sleep(random.uniform(0.8, 1.6))
         except Exception as e:
             print("❌ Fel vid postning till WP:", e)
