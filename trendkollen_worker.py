@@ -339,4 +339,197 @@ def generate_og_image(title: str, cat_slug: str, cat_name: str, date_str: str, o
 
     if with_text:
         padX, padY = 72, 60
-        title
+        title_font = _load_font(FONT_BOLD_PATH, 64, 'Bold')
+        chip_font  = _load_font(FONT_BOLD_PATH, 28, 'Bold')
+        meta_font  = _load_font(FONT_REG_PATH, 28, 'Regular')
+
+        # chip
+        chip_text = cat_name
+        chip_padX, chip_padY = 18, 10
+        chip_text_w, chip_text_h = draw.textbbox((0,0), chip_text, font=chip_font)[2:]
+        chip_w = chip_text_w + chip_padX*2; chip_h = chip_text_h + chip_padY*2
+        chip_x, chip_y = padX, padY
+        draw.rounded_rectangle((chip_x, chip_y, chip_x+chip_w, chip_y+chip_h), radius=16, fill=(255,255,255,38), outline=(255,255,255,64), width=1)
+        draw.text((chip_x+chip_padX, chip_y+chip_padY-2), chip_text, font=chip_font, fill=(255,255,255,230))
+
+        # datum
+        dt_w, _ = draw.textbbox((0,0), date_str, font=meta_font)[2:]
+        draw.text((W-padX-dt_w, padY+2), date_str, font=meta_font, fill=(236,242,255,220))
+
+        # titel (max 3 rader)
+        max_width = W - padX*2; words = re.split(r'\s+', title.strip())
+        lines, size = [], 64
+        while size >= 40:
+            f = _load_font(FONT_BOLD_PATH, size, 'Bold')
+            tmp, cur = [], ""
+            for w in words:
+                test = (cur+" "+w).strip()
+                tw = draw.textbbox((0,0), test, font=f)[2]
+                if tw <= max_width: cur = test
+                else: tmp.append(cur); cur = w
+            if cur: tmp.append(cur)
+            if len(tmp) <= 3:
+                title_font = f; lines = tmp; break
+            size -= 4
+        y = chip_y + chip_h + 36
+        for ln in lines:
+            draw.text((padX, y), ln, font=title_font, fill=(255,255,255,245))
+            y += title_font.size + 6
+
+        brand_font = _load_font(FONT_BOLD_PATH, 24, 'Bold')
+        draw.text((padX, H-60-28), "Trendkoll", font=brand_font, fill=(255,255,255,200))
+
+    img.save(out_path, "PNG")
+
+def upload_media_to_wp(png_path: str, filename: str):
+    url = f"{WP_BASE_URL}/wp-json/wp/v2/media"
+    with open(png_path, "rb") as f:
+        headers = {"Content-Disposition": f'attachment; filename="{filename}"', "Content-Type": "image/png"}
+        resp = requests.post(url, headers=headers, data=f, auth=(WP_USER, WP_APP_PASS), timeout=60)
+    resp.raise_for_status()
+    j = resp.json()
+    return j.get("id"), j.get("source_url")
+
+def set_post_featured_media(post_id: int, media_id: int):
+    url = f"{WP_BASE_URL}/wp-json/wp/v2/trend/{post_id}"
+    resp = requests.post(url, json={"featured_media": media_id}, auth=(WP_USER, WP_APP_PASS), timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+def set_post_social_image_url(post_id: int, social_url: str):
+    url = f"{WP_BASE_URL}/wp-json/wp/v2/trend/{post_id}"
+    resp = requests.post(url, json={"meta": {"tk_social_image": social_url}}, auth=(WP_USER, WP_APP_PASS), timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+# ----- Urval -----
+def pick_diverse_topics(max_total):
+    print(f"▶ YouTube {'ON' if YT_API_KEY else 'OFF'} (region {YT_REGION})")
+    seen_keys = set(); picked = []
+    for cat in CATEGORIES:
+        quota = CATEGORY_QUOTA.get(cat["slug"], 0)
+        if quota <= 0: continue
+
+        titles_pool = []
+        if cat["slug"] == "sport":
+            for q in SPORT_QUERIES:
+                titles_pool.extend(gnews_recent_titles(q, max_items=4, max_age_hours=72))
+        elif cat["slug"] == "prylradar":
+            titles_pool.extend(prylradar_items(max_items=12, max_age_days=14))
+        elif cat["slug"] == "viralt-trend":
+            wiki = wiki_top_sv(limit=10); reddit = reddit_top_sweden(limit=10); yt = youtube_trending_titles(limit=10)
+            print(f"▶ Viralt pool: wiki={len(wiki)} reddit={len(reddit)} youtube={len(yt)}")
+            pool = []; pool.extend(wiki); pool.extend(reddit); pool.extend(yt)
+            titles_pool.extend(pool)
+        else:
+            titles_pool.extend(gnews_recent_titles(cat["query"], max_items=10, max_age_hours=48))
+
+        count = 0
+        for t in titles_pool:
+            if len(picked) >= max_total: break
+            raw_title, origin = (t if isinstance(t, tuple) else (t, ""))
+            clean = clean_topic_title(raw_title)
+            if cat["slug"] in ("prylradar","teknik-prylar"): clean = swedishify_title_if_needed(clean)
+            key = normalize_title_key(clean)
+            if not clean or key in seen_keys: continue
+            picked.append({"title": clean, "cat_slug": cat["slug"], "cat_name": cat["name"], "origin": origin})
+            seen_keys.add(key); count += 1
+            if count >= quota: break
+
+        if len(picked) >= max_total: break
+
+    if len(picked) < max_total:
+        extra = gnews_recent_titles("Sverige", max_items=24, max_age_hours=48)
+        for t in extra:
+            if len(picked) >= max_total: break
+            clean = clean_topic_title(t); key = normalize_title_key(clean)
+            if clean and key not in seen_keys:
+                picked.append({"title": clean, "cat_slug": "nyheter", "cat_name": "Nyheter", "origin": ""})
+                seen_keys.add(key)
+    return picked
+
+# ----- Main -----
+def main():
+    print("🔎 Startar Trendkoll-worker..."); print("BASE_URL:", WP_BASE_URL, "| USER:", WP_USER)
+    date_tag = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    bundles = pick_diverse_topics(max_total=MAX_TRENDS)
+    if not bundles: print("⚠️ Hittade inga topics. Avbryter."); return
+
+    posted_now_keys = set()
+    for b in bundles:
+        title = b["title"]; cat = b["cat_slug"]; cat_name = b["cat_name"]; origin = b.get("origin") or ""
+        key = normalize_title_key(title)
+        print(f"➡️  [{cat}] {title}")
+
+        if key in posted_now_keys: print("⏭️ Hoppar över (dubblett i samma körning)."); continue
+        if wp_trend_exists_exact(title, within_hours=24): print("⏭️ Hoppar över (fanns redan senaste 24h i WP)."); continue
+
+        snippets = gnews_snippets_sv(title, max_items=4, max_age_hours=72)
+        if not snippets and origin:
+            dom = urlparse(origin).netloc or "Källa"
+            snippets = [{"title": dom, "link": origin, "published": ""}]
+
+        try:
+            raw_summary = summarize_with_retries(title, snippets)
+        except Exception as e2:
+            print("❌ OpenAI-fel, kör no-AI fallback:", e2)
+            bullets = "\n".join([f"- {s['title']}" for s in snippets[:3]]) if snippets else "- Ingen nyhetskälla tillgänglig"
+            raw_summary = f"{bullets}\n\nAffiliate-idéer:\n- Sök efter relaterade produkter/tjänster hos dina partnernätverk."
+
+        summary_html = text_to_html(raw_summary)
+        published_str = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')
+        source_items = "".join([f"<li><a href='{s['link']}' target='_blank' rel='nofollow noopener'>{escape(s['title'])}</a></li>" for s in snippets]) if snippets else ""
+        source_header = "<h3>Källor</h3>" if len(snippets) != 1 else "<h3>Källa</h3>"
+        sources_html  = f"{source_header}\n<ul>{source_items or '<li>(Inga källor tillgängliga just nu)</li>'}</ul>"
+
+        body = f"""
+        <p><em>Publicerad: {published_str} UTC</em></p>
+        <div class='tk-summary'>
+{summary_html}
+        </div>
+        {sources_html}
+        """
+
+        excerpt = make_excerpt(raw_summary, max_chars=160)
+
+        try:
+            res = wp_post_trend(
+                title=title, body=body,
+                topics=["idag","svenska-trender", date_tag],
+                categories=[cat], excerpt=excerpt
+            )
+            post_id = res.get("post_id"); print("✅ Postad:", res)
+
+            if post_id:
+                # 1) Card/featured (ingen text)
+                card_path   = f"/tmp/card_trend_{post_id}.png"
+                social_path = f"/tmp/social_trend_{post_id}.png"
+                date_for_img = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+                generate_og_image(title, cat, cat_name, date_for_img, card_path, with_text=False)
+                try:
+                    media_id_card, url_card = upload_media_to_wp(card_path, f"card_trend_{post_id}.png")
+                    set_post_featured_media(post_id, media_id_card)
+                    print(f"🖼️  Featured (card) image satt: {url_card}")
+                except Exception as e:
+                    print("⚠️ Kunde inte sätta featured card image:", e)
+
+                # 2) Social/OG (med text)
+                generate_og_image(title, cat, cat_name, date_for_img, social_path, with_text=True)
+                try:
+                    media_id_social, url_social = upload_media_to_wp(social_path, f"social_trend_{post_id}.png")
+                    set_post_social_image_url(post_id, url_social)
+                    print(f"🔗  Social image satt (og:image): {url_social}")
+                except Exception as e:
+                    print("⚠️ Kunde inte sätta social image:", e)
+
+            posted_now_keys.add(key)
+            time.sleep(random.uniform(0.8, 1.6))
+        except Exception as e:
+            print("❌ Fel vid postning till WP:", e)
+
+    print("🏁 Klar körning.")
+
+if __name__ == "__main__":
+    main()
