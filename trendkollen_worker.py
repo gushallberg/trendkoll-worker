@@ -1,7 +1,7 @@
 # trendkollen_worker.py
 import os, time, random, requests, re, unicodedata, hashlib
 from datetime import datetime, timezone, timedelta
-from urllib.parse import quote, urlparse, parse_qs
+from urllib.parse import quote, urlparse, parse_qs, unquote
 from html import escape, unescape
 import feedparser
 from dotenv import load_dotenv
@@ -56,7 +56,12 @@ WOW_THRESHOLD = {
 # Betrodda domäner där 1 källa räcker
 TRUSTED_ONE_SOURCE = {
     "svt.se","smhi.se","polisen.se","fotbollskanalen.se","svenskfotboll.se",
-    "hockeysverige.se","m3.idg.se","sweclockers.com"
+    "hockeysverige.se","m3.idg.se","sweclockers.com","eliteprospects.com"
+}
+# Betrodda nyhetsdomäner (krav för “nyheter”)
+TRUSTED_NEWS_DOMAINS = {
+    "svt.se","sr.se","tt.se","dn.se","svd.se","gp.se","omni.se","di.se","privataaffarer.se",
+    "hd.se","unt.se","vk.se","nwt.se","na.se","skd.se","smhi.se","polisen.se","aftonbladet.se","expressen.se"
 }
 
 # === Svenska pryl/teknik-feeds + internationell fallback ===
@@ -151,61 +156,105 @@ def gnews_recent_titles(query, max_items=6, max_age_hours=48):
                 break
     return titles
 
+# --- Google News: originalkälla (aldrig consent/news) ---
+GOOGLE_HOSTS = ("google.", "news.google.", "consent.google.", "accounts.google.")
+
 def _first_external_href_from_html(html: str):
     try:
         soup = BeautifulSoup(html, "html.parser")
         for a in soup.find_all("a", href=True):
             href = a["href"]
-            if "news.google.com" not in href:
+            if not any(h in href for h in GOOGLE_HOSTS):
+                return href
+    except Exception:
+        pass
+    return None
+
+def _maybe_strip_consent(u: str) -> str:
+    # consent.google.com/... ?continue=https://news.google.com/...
+    if "consent.google.com" in u:
+        try:
+            cont = parse_qs(urlparse(u).query).get("continue", [""])[0]
+            if cont:
+                return unquote(cont)
+        except Exception:
+            return u
+    return u
+
+def _extract_external_from_news_html(html: str) -> str | None:
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if not any(h in href for h in GOOGLE_HOSTS) and href.startswith("http"):
                 return href
     except Exception:
         pass
     return None
 
 def resolve_final_url(u: str) -> str:
-    if not u: return u
+    if not u: 
+        return u
     try:
         r = requests.head(u, headers=UA_HEADERS, timeout=10, allow_redirects=True)
+        # Om vi landar på Google → prova GET
+        if any(h in r.url for h in GOOGLE_HOSTS):
+            raise HTTPError("Still on Google after HEAD")
         r.raise_for_status()
         return r.url
     except Exception:
         try:
-            r = requests.get(u, headers=UA_HEADERS, timeout=10, allow_redirects=True, stream=True)
-            final = r.url
-            r.close()
-            return final
+            r = requests.get(u, headers=UA_HEADERS, timeout=12, allow_redirects=True)
+            if any(h in r.url for h in GOOGLE_HOSTS):
+                # prova att skrapa HTML efter extern länk
+                ext = _extract_external_from_news_html(r.text)
+                if ext:
+                    return ext
+            else:
+                r.raise_for_status()
+                return r.url
         except Exception:
             return u
 
 def extract_original_from_gnews_entry(entry):
-    link = getattr(entry, "link", "")
-    # Försök 1: följ redirect
-    final = resolve_final_url(link)
-    dom = urlparse(final).netloc if final else ""
-    if final and dom and "news.google.com" not in dom:
-        src_name = getattr(getattr(entry, "source", {}), "title", "") or dom.replace("www.", "")
-        return final, src_name
-    # Försök 2: första externa länk i summary
-    summary = getattr(entry, "summary", "")
-    href2 = _first_external_href_from_html(summary)
-    if href2:
-        dom2 = urlparse(href2).netloc
-        src_name = getattr(getattr(entry, "source", {}), "title", "") or dom2.replace("www.", "")
-        return href2, src_name
-    # Försök 3: url= i query
+    # 1) Försök: plocka direkt från summary (oftast säkrast)
+    summary = getattr(entry, "summary", "") or ""
+    href = _first_external_href_from_html(summary)
+    src_title = ""
+    src_obj = getattr(entry, "source", None) or getattr(entry, "source_detail", None) or {}
     try:
-        q = parse_qs(urlparse(link).query)
-        if "url" in q and q["url"]:
-            href3 = q["url"][0]
-            dom3 = urlparse(href3).netloc
-            if dom3:
-                src_name = getattr(getattr(entry, "source", {}), "title", "") or dom3.replace("www.", "")
-                return href3, src_name
+        src_title = getattr(src_obj, "title", "") or src_obj.get("title","")
     except Exception:
         pass
-    # ge upp
-    src_name = getattr(getattr(entry, "source", {}), "title", "") or (dom.replace("www.", "") if dom else "Källa")
-    return final or link, src_name
+    if href:
+        return href, (src_title or urlparse(href).netloc.replace("www.",""))
+
+    # 2) Hantera consent → news → original
+    link = getattr(entry, "link", "")
+    link = _maybe_strip_consent(link)
+    if link:
+        # Följ/läs news-sidan och plocka första icke-Google-länk
+        try:
+            r = requests.get(link, headers=UA_HEADERS, timeout=12, allow_redirects=True)
+            if not any(h in r.url for h in GOOGLE_HOSTS):
+                # Vi hamnade direkt på extern sajt
+                final = r.url
+            else:
+                # Skrapa HTML
+                final = _extract_external_from_news_html(r.text)
+            if final:
+                return final, (src_title or urlparse(final).netloc.replace("www.",""))
+        except Exception:
+            pass
+
+    # 3) Sista utvägen: prova HEAD/GET-resolve
+    final = resolve_final_url(link)
+    if final and not any(h in final for h in GOOGLE_HOSTS):
+        return final, (src_title or urlparse(final).netloc.replace("www.",""))
+
+    # 4) Ge upp – returnera news-länken med källnamn
+    dom = (urlparse(link).netloc or "").replace("www.","")
+    return link, (src_title or dom or "Källa")
 
 def gnews_snippets_sv(query, max_items=3, max_age_hours=72):
     q = f"{query} when:3d"
@@ -394,6 +443,18 @@ def reasons_to_str(d: dict) -> str:
     if not d: return "{}"
     return "{" + ", ".join(f"{k}:{'+' if v>0 else ''}{v}" for k,v in d.items()) + "}"
 
+# === Clickbait/problematiska titlar ===
+CLICKBAIT_PATTERNS = [
+    r"\bsveriges dummaste\b",
+    r"\bchock(höj|sänk)|chock|skandal|galn(a|e|t)\b",
+    r"du gissar aldrig|så här|det här händer",
+    r"\btrumps\s+kvinna\b",                # explicit case
+    r"\b[a-zåäö]+s\s+kvinna\b",            # poss. form som reducerar person till “kvinna”
+]
+def is_clickbait_title(t: str) -> bool:
+    low = t.lower()
+    return any(re.search(p, low, flags=re.I) for p in CLICKBAIT_PATTERNS)
+
 # === Kandidater per kategori ===
 def pick_diverse_topics(max_total):
     print(f"▶ YouTube {'ON' if YT_API_KEY else 'OFF'} (region {YT_REGION})")
@@ -418,7 +479,8 @@ def pick_diverse_topics(max_total):
         for tup in pool:
             title, origin = tup if isinstance(tup, tuple) else (tup, "")
             clean = clean_topic_title(title)
-            if not clean: continue
+            if not clean or is_clickbait_title(clean): 
+                continue
             if cat["slug"] in ("prylradar","teknik-prylar"): clean = swedishify_title_if_needed(clean)
             key = normalize_title_key(clean)
             if key in seen_keys: continue
@@ -444,7 +506,7 @@ def pick_diverse_topics(max_total):
         for t in extras:
             if len(picked) >= max_total: break
             clean = clean_topic_title(t)
-            if not clean: continue
+            if not clean or is_clickbait_title(clean): continue
             key = normalize_title_key(clean)
             if key in seen_keys: continue
             sc, why = score_candidate(clean, "nyheter", "")
@@ -481,18 +543,17 @@ def text_to_html(txt: str) -> str:
     flush_bullets()
     return "\n".join(parts) if parts else "<p></p>"
 
-# === OpenAI sammanfattning (folkbildningsläge) ===
+# === OpenAI sammanfattning (folkbildningsläge, utan synlig rubrik) ===
 def openai_chat_summarize(topic, snippets, model="gpt-5"):
     system = (
-      "Skriv på enkel svenska (ca högstadienivå), 110–150 ord. Ingen rubrik.\n"
-      "MÅSTE ingå i ordning:\n"
-      "1) Enkelt förklarat: 1 mening som sammanfattar med vardagsord (undvik fackspråk; förklara termer i parentes, t.ex. 'reaktor (el-fabrik)').\n"
-      "2) Detta har hänt: 1–2 meningar (vad/när/var MED namn på personer/bolag/lag och siffror/datum om de finns).\n"
-      "3) Varför det spelar roll: 1–2 meningar (påverkan/siffror: pris, tid, risk, omfattning).\n"
-      "4) Så påverkar det dig: 2–4 punkter som börjar med '- ' (konkreta effekter i vardagen för en person i Sverige).\n"
-      "5) Vad händer härnäst: 1 mening (nästa steg med datum eller tydlig trigger).\n"
-      "Avsluta med: 'Affiliate-idéer:' och 1–2 punkter som börjar med '- '.\n"
-      "Undvik jargong och klichéer. Var specifik. Ingen markdown."
+      "Skriv på enkel svenska (ca högstadienivå), 110–150 ord. Ingen rubrik och ingen etikett som 'Enkelt förklarat'.\n"
+      "Struktur (utan rubriker i texten):\n"
+      "• Första meningen: vardagsnära sammanfattning (undvik jargong; förklara ev. facktermer kort i parentes).\n"
+      "• Detta har hänt: 1–2 meningar (med namn, siffror/datum om finns).\n"
+      "• Varför det spelar roll: 1–2 meningar (påverkan i Sverige, pris/tid/risk/omfång).\n"
+      "• Så påverkar det dig: 2–4 punkter som börjar med '- ' (konkreta vardagseffekter i Sverige).\n"
+      "• Vad händer härnäst: 1 mening (nästa steg med datum/trigger).\n"
+      "Avsluta med: 'Affiliate-idéer:' och 1–2 punkter som börjar med '- '."
     )
     snip = "; ".join([f"{s['title']} ({s['link']})" for s in snippets]) if snippets else "Inga källsnuttar"
     payload = {"model": model,
@@ -538,7 +599,7 @@ def wp_post_trend(title, body, topics=None, categories=None, excerpt=""):
 
 def wp_trend_exists_exact(title, within_hours=24):
     try:
-        url = f"{WP_BASE_URL}/wp-json/wp/v2/trend?search={quote(title)}&per_page=10&orderby=date&order=desc"
+        url = f"{WP_BASE_URL}/wp-json/wp/v2/trend?per_page=10&orderby=date&order=desc"
         resp = requests.get(url, auth=(WP_USER, WP_APP_PASS), timeout=20)
         resp.raise_for_status()
         posts = resp.json()
@@ -570,10 +631,10 @@ def wp_trend_exists_exact(title, within_hours=24):
                 return True
     return False
 
-# hitta “senaste post” genom sök (för event-uppdatering)
-def wp_find_recent_trend_by_query(query: str, within_hours=24):
+def wp_find_recent_trend_by_keywords_recent(keywords: list[str], within_hours=24, per_page=20):
+    """Hämta senaste trend-poster och hitta första vars titel innehåller alla keywords."""
+    url = f"{WP_BASE_URL}/wp-json/wp/v2/trend?per_page={per_page}&orderby=date&order=desc"
     try:
-        url = f"{WP_BASE_URL}/wp-json/wp/v2/trend?search={quote(query)}&per_page=10&orderby=date&order=desc"
         r = requests.get(url, auth=(WP_USER, WP_APP_PASS), timeout=20)
         r.raise_for_status()
         posts = r.json()
@@ -585,10 +646,13 @@ def wp_find_recent_trend_by_query(query: str, within_hours=24):
                 dt = dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
             except Exception:
                 dt = now
-            if (now - dt) <= timedelta(hours=within_hours):
+            if (now - dt) > timedelta(hours=within_hours):
+                continue
+            title = unescape(p.get("title", {}).get("rendered", "")).lower()
+            if all(k.lower() in title for k in keywords):
                 return p.get("id")
     except Exception as e:
-        print("⚠️ wp_find_recent_trend_by_query fel:", e)
+        print("⚠️ wp_find_recent_trend_by_keywords_recent fel:", e)
     return None
 
 def wp_append_update(post_id: int, extra_html: str):
@@ -627,11 +691,9 @@ def generate_og_image(title: str, cat_slug: str, cat_name: str, date_str: str, o
 
     img = Image.new("RGB", (W,H), _hex_to_rgb(base1))
     draw = ImageDraw.Draw(img)
-    # gradient
     for y in range(H):
         t = y / (H-1); col = _grad_color(base1, base2, t)
         draw.line([(0,y),(W,y)], fill=col)
-    # mönster
     for _ in range(120):
         x = random.randint(0,W); y = random.randint(0,H)
         r = random.randint(2,5); alpha = random.randint(18,32)
@@ -717,11 +779,25 @@ def canonical_event_key(title: str):
 def dynamic_min_snippets(cat_slug: str, resolved_snippets: list[dict]) -> int:
     base = MIN_SNIPPETS.get(cat_slug, 1)
     if base <= 1: return base
+    if cat_slug == "sport":
+        sport_signal = any(re.search(r"\b(allsvenskan|shl|landslaget|derby|kvartsfinal|semifinal)\b", r.get("title",""), flags=re.I)
+                           for r in resolved_snippets)
+        for r in resolved_snippets:
+            dom = (urlparse(r['link']).netloc or "").replace("www.","")
+            if sport_signal or any(dom.endswith(d) for d in TRUSTED_ONE_SOURCE):
+                return 1
     for r in resolved_snippets:
         dom = (urlparse(r['link']).netloc or "").replace("www.","")
         if any(dom.endswith(d) for d in TRUSTED_ONE_SOURCE):
             return 1
     return base
+
+def has_trusted_news(resolved_snippets: list[dict]) -> bool:
+    for r in resolved_snippets:
+        dom = (urlparse(r['link']).netloc or "").replace("www.","")
+        if any(dom.endswith(d) for d in TRUSTED_NEWS_DOMAINS):
+            return True
+    return False
 
 # === MAIN ===
 def main():
@@ -763,28 +839,33 @@ def main():
             dom = urlparse(final).netloc.replace("www.", "") if final else "Källa"
             resolved.append({"title": s["title"], "link": final, "source": s.get("source") or dom, "dom": dom})
 
+        # Nyheter måste ha minst en betrodd källa
+        if cat == "nyheter" and resolved and not has_trusted_news(resolved):
+            print("⏭️ Skippas: nyhet utan betrodd källa.")
+            continue
+
         need = dynamic_min_snippets(cat, resolved)
         if len(resolved) < need and not origin:
             print(f"⏭️ Skippas: för få källor ({len(resolved)}/{need})."); continue
+
         if not resolved and origin:
             dom = urlparse(origin).netloc.replace("www.", "") if origin else "Källa"
             resolved = [{"title": dom, "link": origin, "source": dom, "dom": dom}]
 
-        # Event-sammanslagning: uppdatera befintlig post i stället för att skapa ny
+        # Event-sammanslagning
         event_key = canonical_event_key(title)
         if event_key and ("weather:" in event_key or "sport:" in event_key):
             q = event_key.split(":")[1]
-            existing_id = wp_find_recent_trend_by_query(q, within_hours=12)
+            existing_id = wp_find_recent_trend_by_keywords_recent([q], within_hours=12)
             if existing_id:
                 print(f"🔁 Uppdaterar befintlig händelse ({event_key}) → post {existing_id}")
-                # kort uppdatering av typen: text + källor
                 update_txt = f"{title}. " + (", ".join(r['source'] for r in resolved) if resolved else "")
                 update_html = text_to_html(make_excerpt(update_txt, max_chars=220))
                 try:
                     wp_append_update(existing_id, update_html)
                     posted += 1; posted_now_keys.add(key)
                     time.sleep(random.uniform(0.6, 1.2))
-                    continue  # hoppa ny post
+                    continue
                 except Exception as e:
                     print("⚠️ Misslyckades uppdatera, postar nytt istället:", e)
 
@@ -794,7 +875,7 @@ def main():
         except Exception as e2:
             print("❌ OpenAI-fel, kör no-AI fallback:", e2)
             bullets = "\n".join([f"- {r['source']}" for r in resolved[:3]]) if resolved else "- Ingen nyhetskälla tillgänglig"
-            raw_summary = f"Enkelt förklarat: {title}.\n\n{bullets}\n\nAffiliate-idéer:\n- Sök efter relaterade produkter/tjänster hos dina partnernätverk."
+            raw_summary = f"{title}.\n\n{bullets}\n\nAffiliate-idéer:\n- Sök efter relaterade produkter/tjänster hos dina partnernätverk."
 
         summary_html   = text_to_html(raw_summary)
         published_str  = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')
