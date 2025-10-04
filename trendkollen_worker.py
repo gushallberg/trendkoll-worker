@@ -1,12 +1,13 @@
 # trendkollen_worker.py
 import os, time, random, requests, re, unicodedata, hashlib
 from datetime import datetime, timezone, timedelta
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urlparse, parse_qs
 from html import escape, unescape
 import feedparser
 from dotenv import load_dotenv
 from requests.exceptions import ReadTimeout, HTTPError, RequestException
 from PIL import Image, ImageDraw, ImageFont  # Pillow för bildgenerering
+from bs4 import BeautifulSoup  # för att plocka original-länkar ur Google News RSS
 
 load_dotenv()
 
@@ -46,13 +47,19 @@ MIN_SNIPPETS = {
     "nyheter":2, "sport":2, "ekonomi-bors":2,
     "teknik-prylar":1, "prylradar":1, "underhallning":1, "gaming-esport":1, "viralt-trend":2
 }
-# Minsta poäng som krävs för att en kandidat ska anses “wow” nog att väljas
+# Minsta poäng som krävs för “wow”
 WOW_THRESHOLD = {
-    "nyheter":4, "sport":5, "ekonomi-bors":5, "teknik-prylar":4, "prylradar":4,
+    "nyheter":5, "sport":5, "ekonomi-bors":5, "teknik-prylar":4, "prylradar":4,
     "underhallning":3, "gaming-esport":4, "viralt-trend":4
 }
 
-# === Svenska pryl/teknik-feeds (prioriteras) + internationella fallback ===
+# Betrodda domäner där 1 källa räcker
+TRUSTED_ONE_SOURCE = {
+    "svt.se","smhi.se","polisen.se","fotbollskanalen.se","svenskfotboll.se",
+    "hockeysverige.se","m3.idg.se","sweclockers.com"
+}
+
+# === Svenska pryl/teknik-feeds + internationell fallback ===
 PRYL_FEEDS_SV = [
     "https://www.sweclockers.com/feeds/nyheter",
     "https://feber.se/rss/teknik/",
@@ -144,20 +151,18 @@ def gnews_recent_titles(query, max_items=6, max_age_hours=48):
                 break
     return titles
 
-def gnews_snippets_sv(query, max_items=3, max_age_hours=72):
-    q = f"{query} when:3d"
-    url = f"https://news.google.com/rss/search?q={quote(q)}&hl=sv-SE&gl=SE&ceid=SE:sv"
-    feed = fetch_rss(url)
-    items = []
-    for entry in (feed.entries or []):
-        if is_recent(parse_entry_dt(entry), max_age_hours=max_age_hours):
-            items.append({"title": entry.title, "link": entry.link, "published": entry.get("published","")})
-            if len(items) >= max_items:
-                break
-    return items
+def _first_external_href_from_html(html: str):
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if "news.google.com" not in href:
+                return href
+    except Exception:
+        pass
+    return None
 
 def resolve_final_url(u: str) -> str:
-    """Följ omdirigeringar från t.ex. Google News → ge originalkällans URL."""
     if not u: return u
     try:
         r = requests.head(u, headers=UA_HEADERS, timeout=10, allow_redirects=True)
@@ -172,7 +177,54 @@ def resolve_final_url(u: str) -> str:
         except Exception:
             return u
 
-# === Wikipedia: idag → igår → i förrgår, och filtrera bort meta-sidor ===
+def extract_original_from_gnews_entry(entry):
+    link = getattr(entry, "link", "")
+    # Försök 1: följ redirect
+    final = resolve_final_url(link)
+    dom = urlparse(final).netloc if final else ""
+    if final and dom and "news.google.com" not in dom:
+        src_name = getattr(getattr(entry, "source", {}), "title", "") or dom.replace("www.", "")
+        return final, src_name
+    # Försök 2: första externa länk i summary
+    summary = getattr(entry, "summary", "")
+    href2 = _first_external_href_from_html(summary)
+    if href2:
+        dom2 = urlparse(href2).netloc
+        src_name = getattr(getattr(entry, "source", {}), "title", "") or dom2.replace("www.", "")
+        return href2, src_name
+    # Försök 3: url= i query
+    try:
+        q = parse_qs(urlparse(link).query)
+        if "url" in q and q["url"]:
+            href3 = q["url"][0]
+            dom3 = urlparse(href3).netloc
+            if dom3:
+                src_name = getattr(getattr(entry, "source", {}), "title", "") or dom3.replace("www.", "")
+                return href3, src_name
+    except Exception:
+        pass
+    # ge upp
+    src_name = getattr(getattr(entry, "source", {}), "title", "") or (dom.replace("www.", "") if dom else "Källa")
+    return final or link, src_name
+
+def gnews_snippets_sv(query, max_items=3, max_age_hours=72):
+    q = f"{query} when:3d"
+    url = f"https://news.google.com/rss/search?q={quote(q)}&hl=sv-SE&gl=SE&ceid=SE:sv"
+    feed = fetch_rss(url)
+    items = []
+    for entry in (feed.entries or []):
+        if is_recent(parse_entry_dt(entry), max_age_hours=max_age_hours):
+            final_url, source_name = extract_original_from_gnews_entry(entry)
+            items.append({
+                "title": entry.title,
+                "link": final_url,
+                "source": source_name or urlparse(final_url).netloc.replace("www.", "")
+            })
+            if len(items) >= max_items:
+                break
+    return items
+
+# === Wikipedia: idag → igår → i förrgår, filtrera meta-sidor ===
 def wiki_top_sv(limit=10):
     META_PREFIXES = ("Special:", "Huvudsida", "Portal:", "Wikipedia:", "Mall:", "Kategori:", "Diskussion:", "Användare:", "Fil:", "Wikidata:")
     for back in [0,1,2]:
@@ -182,7 +234,7 @@ def wiki_top_sv(limit=10):
             r = requests.get(url, headers=UA_HEADERS, timeout=15)
             r.raise_for_status()
             items = r.json().get("items", [])
-            if not items:
+            if not items: 
                 continue
             arts = items[0].get("articles", [])
             res = []
@@ -201,7 +253,7 @@ def wiki_top_sv(limit=10):
             continue
     return []
 
-# === Reddit: JSON → RSS fallback (hanterar 403) ===
+# === Reddit: JSON → RSS fallback ===
 def reddit_top_sweden(limit=10):
     url_json = "https://www.reddit.com/r/sweden/top/.json?t=day&limit=20"
     try:
@@ -214,7 +266,6 @@ def reddit_top_sweden(limit=10):
         return titles[:limit]
     except Exception as e:
         print("⚠️ reddit_top_sweden fel:", e)
-
     try:
         feed = fetch_rss("https://www.reddit.com/r/sweden/top/.rss?t=day&limit=20")
         titles = [e.title for e in (feed.entries or [])]
@@ -227,8 +278,7 @@ def reddit_top_sweden(limit=10):
 
 # === YouTube trending (valfritt) ===
 def youtube_trending_titles(limit=10):
-    if not YT_API_KEY:
-        return []
+    if not YT_API_KEY: return []
     try:
         url = ("https://www.googleapis.com/youtube/v3/videos"
                f"?part=snippet&chart=mostPopular&regionCode={quote(YT_REGION)}"
@@ -258,34 +308,31 @@ def feed_titles(feed_urls, max_items=20, max_age_days=14):
             break
     return items
 
-# === Prylradar: svenska först, GNews .se-filter, sedan internationell fallback ===
+# === Prylradar ===
 def prylradar_items(max_items=12, max_age_days=14):
     items = []
     items.extend(feed_titles(PRYL_FEEDS_SV, max_items=max_items, max_age_days=max_age_days))
-
     if len(items) < max_items:
         for q in PRYL_QUERIES:
             for domain in ["site:surfa.se", "site:m3.idg.se", "site:mobil.se", "site:sweclockers.com",
                            "site:feber.se", "site:nyteknik.se"]:
                 ts = gnews_recent_titles(f"{q} {domain}", max_items=3, max_age_hours=max_age_days*24)
                 for t in ts:
-                    items.append((t, ""))  # ok utan origin-länk
+                    items.append((t, ""))  # origin ok
                     if len(items) >= max_items:
                         break
-                if len(items) >= max_items:
-                    break
-            if len(items) >= max_items:
-                break
-
+                if len(items) >= max_items: break
+            if len(items) >= max_items: break
     if len(items) < max_items:
         items.extend(feed_titles(PRYL_FEEDS_INT, max_items=max_items - len(items), max_age_days=max_age_days))
-
     return items[:max_items]
 
-# === Rubrikstädning + "svenskifiering" ===
+# === Rubrikstädning + svenskifiering ===
 def clean_topic_title(t: str) -> str:
     t = t.strip()
-    t = re.sub(r'^(JUST NU:|DN Direkt\s*-\s*|LIVE:)\s*', '', t, flags=re.I)
+    t = re.sub(r'^(JUST NU:|DN Direkt\s*-\s*|LIVE:|AB:\s*|Aftonbladet:\s*|Expressen:\s*)\s*', '', t, flags=re.I)
+    if re.match(r'^(se\s|ett inlägg i\s*”?se)', t, flags=re.I):
+        return ""  # tv-promo
     t = re.sub(r'\s+[–-]\s+[^\-–—|:]{2,}$', '', t).strip()
     return t
 
@@ -309,7 +356,7 @@ def swedishify_title_if_needed(title: str) -> str:
         t = re.sub(k, v, t, flags=re.I)
     return clean_topic_title(t)
 
-# === "Svenskhet" heuristik + poängsystem ===
+# === “Svenskhet” heuristik + poängsystem ===
 SV_DOMAINS = {"svt.se","svtplay.se","sr.se","aftonbladet.se","expressen.se","dn.se","svd.se","gp.se","nyheter24.se",
               "omni.se","breakit.se","di.se","privataaffarer.se","sweclockers.com","m3.idg.se","mobil.se","surfa.se",
               "nyteknik.se","feber.se","fotbollskanalen.se","hockeysverige.se","svenskafans.com"}
@@ -318,145 +365,97 @@ SPORT_WORDS = {"allsvenskan","shl","slutspel","kvartsfinal","semifinal","landsla
 SE_WORDS = {"sverige","svensk","svenska","stockholm","göteborg","malmö","umeå","luleå","umea","lulea","örebro","uppsala","borås","boras"}
 
 def is_probably_swedish(title: str) -> bool:
-    if re.search(r"[åäöÅÄÖ]", title):
-        return True
+    if re.search(r"[åäöÅÄÖ]", title): return True
     return bool(re.search(r"\b(är|och|eller|men|som|på|för|med|utan|en|ett|det|den|i|från)\b", title, flags=re.I))
 
 def score_candidate(title: str, cat_slug: str, origin: str):
-    score = 0
-    reasons = {}
-
-    if is_probably_swedish(title):
-        score += 3; reasons["åäö/sv-ord"] = +3
-
+    score = 0; reasons = {}
+    if is_probably_swedish(title): score += 3; reasons["åäö/sv-ord"] = +3
     dom = ""
     if origin:
-        try:
-            dom = urlparse(origin).netloc.lower()
-        except Exception:
-            dom = ""
+        try: dom = urlparse(origin).netloc.lower()
+        except Exception: dom = ""
     if dom:
-        if dom.endswith(".se") or dom in SV_DOMAINS:
-            score += 3; reasons[".se/domän"] = +3
-        elif dom.endswith(".com"):
-            pass  # neutral
-        else:
-            score -= 1; reasons["utländsk domän"] = -1
-
-    if any(w in title.lower() for w in SE_WORDS):
-        score += 2; reasons["Sverige-ord"] = +2
-
-    if cat_slug == "sport":
-        if any(w in title.lower() for w in SPORT_WORDS):
-            score += 2; reasons["sport-ord"] = +2
-
-    if cat_slug in ("prylradar","teknik-prylar","gaming-esport"):
-        if re.search(r"\b(lanser|släpper|uppdatering|recension|test|release|utrullning)\b", title, flags=re.I):
-            score += 2; reasons["pryl-signal"] = +2
-
-    if re.search(r"\b(India|Indien|China|Kina|USA|US|UK)\b", title):
-        if not any(w in title.lower() for w in ("sverige","svensk","stockholm","göteborg","malmö")):
-            score -= 2; reasons["utlandsfokus"] = -2
-
+        if dom.endswith(".se") or dom in SV_DOMAINS: score += 3; reasons[".se/domän"] = +3
+        elif not dom.endswith(".com"): score -= 1; reasons["utländsk domän"] = -1
+    if any(w in title.lower() for w in SE_WORDS): score += 2; reasons["Sverige-ord"] = +2
+    if cat_slug == "sport" and any(w in title.lower() for w in SPORT_WORDS): score += 2; reasons["sport-ord"] = +2
+    if cat_slug in ("prylradar","teknik-prylar","gaming-esport") and re.search(r"\b(lanser|släpper|uppdatering|recension|test|release|utrullning)\b", title, flags=re.I):
+        score += 2; reasons["pryl-signal"] = +2
+    if re.search(r"\b(India|Indien|China|Kina|USA|US|UK)\b", title) and not any(w in title.lower() for w in ("sverige","svensk","stockholm","göteborg","malmö")):
+        score -= 2; reasons["utlandsfokus"] = -2
     L = len(title)
-    if L < 28:
-        score -= 1; reasons["för kort"] = -1
-    elif L > 120:
-        score -= 1; reasons["för lång"] = -1
-    else:
-        score += 1; reasons["lagom längd"] = +1
-
+    if L < 28: score -= 1; reasons["för kort"] = -1
+    elif L > 120: score -= 1; reasons["för lång"] = -1
+    else: score += 1; reasons["lagom längd"] = +1
     return score, reasons
 
 def reasons_to_str(d: dict) -> str:
     if not d: return "{}"
-    parts = [f"{k}:{'+' if v>0 else ''}{v}" for k,v in d.items()]
-    return "{" + ", ".join(parts) + "}"
+    return "{" + ", ".join(f"{k}:{'+' if v>0 else ''}{v}" for k,v in d.items()) + "}"
 
-# === Samla kandidater per kategori och välj topp efter poäng ===
+# === Kandidater per kategori ===
 def pick_diverse_topics(max_total):
     print(f"▶ YouTube {'ON' if YT_API_KEY else 'OFF'} (region {YT_REGION})")
-    seen_keys = set()
-    picked = []
-
+    seen_keys = set(); picked = []
     for cat in CATEGORIES:
         quota = CATEGORY_QUOTA.get(cat["slug"], 0)
-        if quota <= 0: 
-            continue
-
+        if quota <= 0: continue
         pool = []
         if cat["slug"] == "sport":
             for q in SPORT_QUERIES:
-                for t in gnews_recent_titles(q, max_items=6, max_age_hours=72):
-                    pool.append((t, ""))  # origin okänd
+                for t in gnews_recent_titles(q, max_items=6, max_age_hours=72): pool.append((t, ""))
         elif cat["slug"] == "prylradar":
-            pool.extend(prylradar_items(max_items=24, max_age_days=14))  # (title, origin)
+            pool.extend(prylradar_items(max_items=24, max_age_days=14))
         elif cat["slug"] == "viralt-trend":
-            wiki = wiki_top_sv(limit=15)
-            reddit = reddit_top_sweden(limit=15)
-            yt = youtube_trending_titles(limit=15)
+            wiki = wiki_top_sv(limit=15); reddit = reddit_top_sweden(limit=15); yt = youtube_trending_titles(limit=15)
             print(f"▶ Viralt pool: wiki={len(wiki)} reddit={len(reddit)} youtube={len(yt)}")
-            pool.extend([(t, "") for t in wiki])
-            pool.extend([(t, "") for t in reddit])
-            pool.extend([(t, "") for t in yt])
+            pool += [(t, "") for t in wiki] + [(t, "") for t in reddit] + [(t, "") for t in yt]
         else:
-            for t in gnews_recent_titles(cat["query"], max_items=18, max_age_hours=48):
-                pool.append((t, ""))
+            for t in gnews_recent_titles(cat["query"], max_items=18, max_age_hours=48): pool.append((t, ""))
 
         ranked = []
         for tup in pool:
             title, origin = tup if isinstance(tup, tuple) else (tup, "")
             clean = clean_topic_title(title)
-            if cat["slug"] in ("prylradar","teknik-prylar"):
-                clean = swedishify_title_if_needed(clean)
+            if not clean: continue
+            if cat["slug"] in ("prylradar","teknik-prylar"): clean = swedishify_title_if_needed(clean)
             key = normalize_title_key(clean)
-            if not clean or key in seen_keys:
-                continue
+            if key in seen_keys: continue
             sc, why = score_candidate(clean, cat["slug"], origin)
             ranked.append({"title": clean, "origin": origin, "cat_slug": cat["slug"], "cat_name": cat["name"], "score": sc, "why": why, "key": key})
 
-        # Filtrera för WOW-tröskel och sortera
         thr = WOW_THRESHOLD.get(cat["slug"], 3)
         ranked = [r for r in ranked if r["score"] >= thr]
         ranked.sort(key=lambda x: x["score"], reverse=True)
 
-        # Logga toppkandidater (debug)
         for r in ranked[:3]:
             print(f"🧪 {cat['slug']} kandidat: {r['title']} | score={r['score']} {reasons_to_str(r['why'])}")
 
         count = 0
         for r in ranked:
-            if count >= quota or len(picked) >= max_total:
-                break
-            if r["key"] in seen_keys:
-                continue
-            picked.append(r)  # behåll score/why för loggning senare
-            seen_keys.add(r["key"])
-            count += 1
+            if count >= quota or len(picked) >= max_total: break
+            if r["key"] in seen_keys: continue
+            picked.append(r); seen_keys.add(r["key"]); count += 1
+        if len(picked) >= max_total: break
 
-        if len(picked) >= max_total:
-            break
-
-    # Fyll på med "Sverige" om vi ändå saknar
     if len(picked) < max_total:
         extras = gnews_recent_titles("Sverige", max_items=50, max_age_hours=48)
         for t in extras:
-            if len(picked) >= max_total:
-                break
+            if len(picked) >= max_total: break
             clean = clean_topic_title(t)
+            if not clean: continue
             key = normalize_title_key(clean)
-            if clean and key not in seen_keys:
-                sc, why = score_candidate(clean, "nyheter", "")
-                if sc >= WOW_THRESHOLD.get("nyheter", 3):
-                    picked.append({"title": clean, "origin": "", "cat_slug": "nyheter", "cat_name": "Nyheter", "score": sc, "why": why, "key": key})
-                    seen_keys.add(key)
-
+            if key in seen_keys: continue
+            sc, why = score_candidate(clean, "nyheter", "")
+            if sc >= WOW_THRESHOLD.get("nyheter", 3):
+                picked.append({"title": clean, "origin": "", "cat_slug": "nyheter", "cat_name": "Nyheter", "score": sc, "why": why, "key": key})
+                seen_keys.add(key)
     return picked
 
 # === Text / utdrag ===
 def make_excerpt(raw_text: str, max_chars=160) -> str:
-    if not raw_text:
-        return ""
+    if not raw_text: return ""
     parts = [p.strip() for p in re.split(r'[.!?]\s+', raw_text) if p.strip()]
     for p in parts:
         if not p.startswith("-") and not p.lower().startswith("affiliate-idéer"):
@@ -482,27 +481,23 @@ def text_to_html(txt: str) -> str:
     flush_bullets()
     return "\n".join(parts) if parts else "<p></p>"
 
-# === OpenAI sammanfattning (GPT-5 → GPT-5-mini) ===
+# === OpenAI sammanfattning (folkbildningsläge) ===
 def openai_chat_summarize(topic, snippets, model="gpt-5"):
     system = (
-        "Skriv på svenska, 110–150 ord. Ingen rubrik.\n"
-        "Måste uppfylla: (1) Nämn NAMN/ENTITETER (bolag, lag, personer) och KONKRETA SIFFROR/DATUM om de finns i källorna.\n"
-        "(2) Struktur:\n"
-        "- Detta har hänt: 1–2 meningar (vad/när/var, med namn).\n"
-        "- Varför det spelar roll: 1–2 meningar (påverkan + siffror/omfång).\n"
-        "- Vad händer härnäst: 1 mening (nästa steg med datum eller trigger).\n"
-        "Lägg sedan 2–3 punkter som börjar med '- '.\n"
-        "Avsluta med: 'Affiliate-idéer:' och 1–2 punkter som börjar med '- '.\n"
-        "Undvik fluff och klichéer; var specifik.\n"
+      "Skriv på enkel svenska (ca högstadienivå), 110–150 ord. Ingen rubrik.\n"
+      "MÅSTE ingå i ordning:\n"
+      "1) Enkelt förklarat: 1 mening som sammanfattar med vardagsord (undvik fackspråk; förklara termer i parentes, t.ex. 'reaktor (el-fabrik)').\n"
+      "2) Detta har hänt: 1–2 meningar (vad/när/var MED namn på personer/bolag/lag och siffror/datum om de finns).\n"
+      "3) Varför det spelar roll: 1–2 meningar (påverkan/siffror: pris, tid, risk, omfattning).\n"
+      "4) Så påverkar det dig: 2–4 punkter som börjar med '- ' (konkreta effekter i vardagen för en person i Sverige).\n"
+      "5) Vad händer härnäst: 1 mening (nästa steg med datum eller tydlig trigger).\n"
+      "Avsluta med: 'Affiliate-idéer:' och 1–2 punkter som börjar med '- '.\n"
+      "Undvik jargong och klichéer. Var specifik. Ingen markdown."
     )
     snip = "; ".join([f"{s['title']} ({s['link']})" for s in snippets]) if snippets else "Inga källsnuttar"
-    payload = {
-        "model": model,
-        "messages": [
-            {"role":"system","content":system},
-            {"role":"user","content": f"Ämne: {topic}\nNyhetssnuttar: {snip}"}
-        ]
-    }
+    payload = {"model": model,
+               "messages": [{"role":"system","content":system},
+                            {"role":"user","content": f"Ämne: {topic}\nNyhetssnuttar: {snip}"}]}
     resp = requests.post("https://api.openai.com/v1/chat/completions",
                          headers={"Authorization": f"Bearer {OPENAI_API_KEY}",
                                   "Content-Type": "application/json"},
@@ -555,8 +550,7 @@ def wp_trend_exists_exact(title, within_hours=24):
         raw_gmt = p.get("date_gmt") or ""
         raw_loc = p.get("date") or ""
         for s in (raw_gmt, raw_loc):
-            if not s: 
-                continue
+            if not s: continue
             try:
                 dt = datetime.fromisoformat(s.replace("Z","+00:00"))
                 dt = dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
@@ -576,6 +570,39 @@ def wp_trend_exists_exact(title, within_hours=24):
                 return True
     return False
 
+# hitta “senaste post” genom sök (för event-uppdatering)
+def wp_find_recent_trend_by_query(query: str, within_hours=24):
+    try:
+        url = f"{WP_BASE_URL}/wp-json/wp/v2/trend?search={quote(query)}&per_page=10&orderby=date&order=desc"
+        r = requests.get(url, auth=(WP_USER, WP_APP_PASS), timeout=20)
+        r.raise_for_status()
+        posts = r.json()
+        now = datetime.now(timezone.utc)
+        for p in posts:
+            raw = (p.get("date_gmt") or p.get("date") or "").replace("Z","+00:00")
+            try:
+                dt = datetime.fromisoformat(raw)
+                dt = dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+            except Exception:
+                dt = now
+            if (now - dt) <= timedelta(hours=within_hours):
+                return p.get("id")
+    except Exception as e:
+        print("⚠️ wp_find_recent_trend_by_query fel:", e)
+    return None
+
+def wp_append_update(post_id: int, extra_html: str):
+    url = f"{WP_BASE_URL}/wp-json/wp/v2/trend/{post_id}"
+    try:
+        cur = requests.get(url, auth=(WP_USER, WP_APP_PASS), timeout=20).json()
+        old_content = cur.get("content",{}).get("rendered","")
+    except Exception:
+        old_content = ""
+    new_content = old_content + "\n<hr />\n<h3>Uppdatering</h3>\n" + extra_html
+    resp = requests.post(url, json={"content": new_content}, auth=(WP_USER, WP_APP_PASS), timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
 # === Bildgenerator (card + social) ===
 def _hex_to_rgb(h): h=h.lstrip('#'); return tuple(int(h[i:i+2],16) for i in (0,2,4))
 def _lerp(a,b,t): return int(a+(b-a)*t)
@@ -594,18 +621,15 @@ def _load_font(path, size, label=''):
         return ImageFont.load_default()
 
 def generate_og_image(title: str, cat_slug: str, cat_name: str, date_str: str, out_path: str, with_text: bool = True):
-    """1200x630 PNG. with_text=False => ren card-bild (ingen text) för grid/featured."""
     W,H = 1200, 630
     base1, base2 = CAT_COLORS.get(cat_slug, ("#111827","#374151"))
-    seed = _seed_from_title(title)
-    random.seed(seed)
+    seed = _seed_from_title(title); random.seed(seed)
 
     img = Image.new("RGB", (W,H), _hex_to_rgb(base1))
     draw = ImageDraw.Draw(img)
     # gradient
     for y in range(H):
-        t = y / (H-1)
-        col = _grad_color(base1, base2, t)
+        t = y / (H-1); col = _grad_color(base1, base2, t)
         draw.line([(0,y),(W,y)], fill=col)
     # mönster
     for _ in range(120):
@@ -621,7 +645,6 @@ def generate_og_image(title: str, cat_slug: str, cat_name: str, date_str: str, o
         chip_font  = _load_font(FONT_BOLD_PATH, 28, 'Bold')
         meta_font  = _load_font(FONT_REG_PATH, 28, 'Regular')
 
-        # kategori-chip
         chip_text = cat_name
         chip_padX, chip_padY = 18, 10
         chip_text_w, chip_text_h = draw.textbbox((0,0), chip_text, font=chip_font)[2:]
@@ -631,11 +654,9 @@ def generate_og_image(title: str, cat_slug: str, cat_name: str, date_str: str, o
                                fill=(255,255,255,38), outline=(255,255,255,64), width=1)
         draw.text((chip_x+chip_padX, chip_y+chip_padY-2), chip_text, font=chip_font, fill=(255,255,255,230))
 
-        # datum
         dt_w, _ = draw.textbbox((0,0), date_str, font=meta_font)[2:]
         draw.text((W-padX-dt_w, padY+2), date_str, font=meta_font, fill=(236,242,255,220))
 
-        # titel (wrap ≤3 rader)
         max_width = W - padX*2; words = re.split(r'\s+', title.strip())
         lines, size = [], 64
         while size >= 40:
@@ -682,24 +703,40 @@ def set_post_social_image_url(post_id: int, social_url: str):
     resp.raise_for_status()
     return resp.json()
 
+# === Event-grouping: slå ihop upprepade händelser (storm, sport, etc.) ===
+def canonical_event_key(title: str):
+    t = title.lower()
+    m = re.search(r"(stormen|orkan(en)?)\s+([a-zåäö]+)", t)
+    if m: return f"weather:{m.group(3)}"
+    clubs = ["mjällby","mff","malmö ff","häcken","aik","djurgården","hammarby","ifk","elfsborg","norrköping","rosengård","brynäs","frölunda"]
+    for c in clubs:
+        if c in t: return f"sport:{c}"
+    if "kärnkraft" in t: return "policy:karnkraft"
+    return None
+
+def dynamic_min_snippets(cat_slug: str, resolved_snippets: list[dict]) -> int:
+    base = MIN_SNIPPETS.get(cat_slug, 1)
+    if base <= 1: return base
+    for r in resolved_snippets:
+        dom = (urlparse(r['link']).netloc or "").replace("www.","")
+        if any(dom.endswith(d) for d in TRUSTED_ONE_SOURCE):
+            return 1
+    return base
+
 # === MAIN ===
 def main():
     print("🔎 Startar Trendkoll-worker...")
     print("BASE_URL:", WP_BASE_URL, "| USER:", WP_USER)
 
     date_tag = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    # Översampla 3× så vi kan hoppa över dubbletter men ändå nå kvoten
     bundles = pick_diverse_topics(max_total=MAX_TRENDS * 3)
     if not bundles:
-        print("⚠️ Hittade inga topics. Avbryter.")
-        return
+        print("⚠️ Hittade inga topics. Avbryter."); return
 
-    posted_now_keys = set()
-    posted = 0
+    posted_now_keys = set(); posted = 0
 
     for b in bundles:
-        if posted >= MAX_TRENDS:
-            break
+        if posted >= MAX_TRENDS: break
 
         title    = b["title"]
         cat      = b["cat_slug"]
@@ -710,51 +747,66 @@ def main():
         why      = b.get("why", {})
 
         print(f"➡️  [{cat}] {title}")
-        if score is not None:
-            print(f"🧮 score={score} {reasons_to_str(why)}")
+        if score is not None: print(f"🧮 score={score} {reasons_to_str(why)}")
 
         # Dubblettskydd
         if key in posted_now_keys:
-            print("⏭️ Hoppar över (dubblett i samma körning).")
-            continue
+            print("⏭️ Hoppar över (dubblett i samma körning)."); continue
         if wp_trend_exists_exact(title, within_hours=24):
-            print("⏭️ Hoppar över (fanns redan senaste 24h i WP).")
-            continue
+            print("⏭️ Hoppar över (fanns redan senaste 24h i WP)."); continue
 
-        # Källsnuttar (GNews) och direktlänkar
+        # Snippets + källor (riktiga URL:er, varumärke + domän)
         snippets = gnews_snippets_sv(title, max_items=4, max_age_hours=72)
-        # Byt ut news.google.com till final-URL och använd domännamn
         resolved = []
         for s in snippets:
-            final = resolve_final_url(s['link'])
+            final = s["link"]
             dom = urlparse(final).netloc.replace("www.", "") if final else "Källa"
-            resolved.append({"title": s["title"], "link": final, "dom": dom})
+            resolved.append({"title": s["title"], "link": final, "source": s.get("source") or dom, "dom": dom})
 
-        need = MIN_SNIPPETS.get(cat, 1)
+        need = dynamic_min_snippets(cat, resolved)
         if len(resolved) < need and not origin:
-            print(f"⏭️ Skippas: för få källor ({len(resolved)}/{need}).")
-            continue
-
-        # Om vi saknar snippets men har origin (t.ex. prylradar), bygg en enkel källrad
+            print(f"⏭️ Skippas: för få källor ({len(resolved)}/{need})."); continue
         if not resolved and origin:
             dom = urlparse(origin).netloc.replace("www.", "") if origin else "Källa"
-            resolved = [{"title": dom, "link": origin, "dom": dom}]
+            resolved = [{"title": dom, "link": origin, "source": dom, "dom": dom}]
 
-        # Summering (GPT-5 → 5-mini → fallback)
+        # Event-sammanslagning: uppdatera befintlig post i stället för att skapa ny
+        event_key = canonical_event_key(title)
+        if event_key and ("weather:" in event_key or "sport:" in event_key):
+            q = event_key.split(":")[1]
+            existing_id = wp_find_recent_trend_by_query(q, within_hours=12)
+            if existing_id:
+                print(f"🔁 Uppdaterar befintlig händelse ({event_key}) → post {existing_id}")
+                # kort uppdatering av typen: text + källor
+                update_txt = f"{title}. " + (", ".join(r['source'] for r in resolved) if resolved else "")
+                update_html = text_to_html(make_excerpt(update_txt, max_chars=220))
+                try:
+                    wp_append_update(existing_id, update_html)
+                    posted += 1; posted_now_keys.add(key)
+                    time.sleep(random.uniform(0.6, 1.2))
+                    continue  # hoppa ny post
+                except Exception as e:
+                    print("⚠️ Misslyckades uppdatera, postar nytt istället:", e)
+
+        # Sammanfattning
         try:
-            raw_summary = summarize_with_retries(title, [{"title": r["dom"], "link": r["link"]} for r in resolved])
+            raw_summary = summarize_with_retries(title, [{"title": r["source"], "link": r["link"]} for r in resolved])
         except Exception as e2:
             print("❌ OpenAI-fel, kör no-AI fallback:", e2)
-            bullets = "\n".join([f"- {r['dom']}" for r in resolved[:3]]) if resolved else "- Ingen nyhetskälla tillgänglig"
-            raw_summary = f"{bullets}\n\nAffiliate-idéer:\n- Sök efter relaterade produkter/tjänster hos dina partnernätverk."
+            bullets = "\n".join([f"- {r['source']}" for r in resolved[:3]]) if resolved else "- Ingen nyhetskälla tillgänglig"
+            raw_summary = f"Enkelt förklarat: {title}.\n\n{bullets}\n\nAffiliate-idéer:\n- Sök efter relaterade produkter/tjänster hos dina partnernätverk."
 
-        summary_html = text_to_html(raw_summary)
-        published_str = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')
+        summary_html   = text_to_html(raw_summary)
+        published_str  = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')
 
-        source_items = "".join(
-            f"<li><a href='{r['link']}' target='_blank' rel='nofollow noopener'>{escape(r['dom'])}</a></li>"
-            for r in resolved
-        ) if resolved else ""
+        # Källrendering
+        li = []
+        for r in resolved:
+            dom = (urlparse(r['link']).netloc or "").replace("www.","")
+            label = r.get("source") or dom or "Källa"
+            label_full = f"{label} ({dom})" if dom and label.lower() not in dom.lower() else label
+            li.append(f"<li><a href='{r['link']}' target='_blank' rel='nofollow noopener'>{escape(label_full)}</a></li>")
+        source_items = "".join(li)
         source_header = "<h3>Källor</h3>" if len(resolved) != 1 else "<h3>Källa</h3>"
         sources_html  = f"{source_header}\n<ul>{source_items or '<li>(Inga källor tillgängliga just nu)</li>'}</ul>"
 
@@ -780,7 +832,6 @@ def main():
             print("✅ Postad:", res)
 
             if post_id:
-                # 1) Card/featured (ingen text)
                 card_path   = f"/tmp/card_trend_{post_id}.png"
                 social_path = f"/tmp/social_trend_{post_id}.png"
                 date_for_img = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -793,7 +844,6 @@ def main():
                 except Exception as e:
                     print("⚠️ Kunde inte sätta featured card image:", e)
 
-                # 2) Social/OG (med text)
                 generate_og_image(title, cat, cat_name, date_for_img, social_path, with_text=True)
                 try:
                     media_id_social, url_social = upload_media_to_wp(social_path, f"social_trend_{post_id}.png")
@@ -802,13 +852,13 @@ def main():
                 except Exception as e:
                     print("⚠️ Kunde inte sätta social image:", e)
 
-            posted_now_keys.add(key)
-            posted += 1
+            posted_now_keys.add(key); posted += 1
             time.sleep(random.uniform(0.8, 1.6))
 
         except Exception as e:
             print("❌ Fel vid postning till WP:", e)
 
+    print(f"📊 Summering: publicerade={posted}, översamlade={len(bundles)}, kvar_kvot={max(0, MAX_TRENDS-posted)}")
     print("🏁 Klar körning.")
 
 if __name__ == "__main__":
